@@ -40,6 +40,7 @@ export function buildActiveContextTool(input: {
   const epochGuidance = input.allowedActions.includes("brief")
     ? " THE RUNTIME CUTS THE FOLDS AND YOU ANNOTATE THEM. As raw material piles up it is cut into pending folds behind you, stalest first. A pending fold moves NO context bytes: you keep seeing the raw material exactly as it is, and the fold reaches your window only when a commit applies it. You are told when folds are cut and which ones carry no brief yet. Answer with brief, one id and one sentence: you know why the span mattered and what you will want back from it, and the deterministic brief that fills the gap reads the span alone and does not. Writing a brief on a pending fold is FREE, because the fold is not in your window yet; briefing a standing fold is refused, because its placeholder is in your window and rewriting it rewrites your context from that point on. reboundary re-cuts a span the runtime got wrong, unmark withdraws a cut you do not want taken, and when to commit stays the runtime's to decide. READING A BRIEF BACK IS A DIFFERENT CALL FROM WRITING ONE: a listing row carries an interval rather than a brief, so peek with briefOnly on a fold id returns the brief, kind, depth, child count and sizes from state for a handful of tokens instead of a window of source. That is the only way to read a brief no placeholder shows, which is the case for every fold a visible parent hides."
     : "";
+  const listingGuidance = " Listing arrays are byte-bounded so a status page stays small, so a listing may show only its newest rows: when rows are dropped, continuation reports how many of what and gives the exact call that pages the rest, and a truncated pending list arrives as pendingFoldsSample rather than pendingFolds, so the key itself states that it was cut.";
   const recoveryGuidance = input.allowedActions.includes("expand")
     ? " A fold brief is an index entry, not the source: when a question or task depends on material that is folded, peek or expand that fold and answer from the exact bytes, never from memory of them. Recalling folded detail without reopening it is how specifics get misremembered."
     : "";
@@ -48,8 +49,8 @@ export function buildActiveContextTool(input: {
     name: input.name,
     label: input.label,
     description: input.fullSurface
-      ? `Page, peek, brief, expand, refold, pin, or re-cut exact Pi active-context evidence.${peekGuidance}${correctionGuidance}${pinGuidance}${epochGuidance}${recoveryGuidance}${standingGuidance} Mutations persist immediately and affect the next model call inside the same continuing turn; no turn boundary is required. Supplied fold briefs have a hard ${input.maxBriefChars}-character maximum.`
-      : `Use only the configured active-context actions: ${input.allowedActions.join(", ")}.${peekGuidance}${correctionGuidance}${pinGuidance}${epochGuidance}${recoveryGuidance}${standingGuidance} Supplied fold briefs have a hard ${input.maxBriefChars}-character maximum.`,
+      ? `Page, peek, brief, expand, refold, pin, or re-cut exact Pi active-context evidence.${peekGuidance}${correctionGuidance}${pinGuidance}${epochGuidance}${listingGuidance}${recoveryGuidance}${standingGuidance} Mutations persist immediately and affect the next model call inside the same continuing turn; no turn boundary is required. Supplied fold briefs have a hard ${input.maxBriefChars}-character maximum.`
+      : `Use only the configured active-context actions: ${input.allowedActions.join(", ")}.${peekGuidance}${correctionGuidance}${pinGuidance}${epochGuidance}${listingGuidance}${recoveryGuidance}${standingGuidance} Supplied fold briefs have a hard ${input.maxBriefChars}-character maximum.`,
     parameters: {
       type: "object",
       additionalProperties: false,

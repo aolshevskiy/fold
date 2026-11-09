@@ -99,8 +99,14 @@ export function foldNoticeText(input: {
     .map((fold) => `${fold.id} (${fold.kind}, ~${fold.tokens} tokens` +
       `${fold.briefed ? ", briefed" : ""})` +
       (fold.brief ? `: ${oneLine(fold.brief, NOTICE_ROW_CHARS)}` : ""));
+  // THE POINTER NAMES THE PAGE THAT HOLDS THE ROWS (2026-11-09). It used to say
+  // `{"action":"status"} lists the other N`, which is true only through that page's
+  // `continuation` field -- and the inline list it lands on is itself bounded to as few as
+  // one row. So the sentence counted 67 rows and pointed at a summary holding one, which
+  // is the same laundering the continuation exists to prevent, one hop further out. The
+  // exact call travels instead of a description of one, because a reader copies it.
   const overflowText = (seated: number) =>
-    `${input.toolName} {"action":"status"} lists the other ${input.staged.length - seated}.`;
+    `${input.toolName} {"action":"status","detail":"marks"} lists all ${input.staged.length}.`;
   let seated = entries.length;
   let list = `Staged spans: ${entries.join("; ")}.`;
   while (seated > 0 && Buffer.byteLength(`${head}\n${list}`, "utf8") > FOLD_NOTICE_BYTES) {

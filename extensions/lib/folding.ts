@@ -1325,6 +1325,17 @@ export function boundStatusPayload(
   // Only the operational copy is floored. `scheduling.marks` is the accounting duplicate,
   // and a subset kept at the original's expense is the inversion the order above forbids.
   const pendingTrimmed = shrink(automatic, "pendingFolds", "pending fold row(s)", true, 1) > 0;
+  // THE NAME CARRIES THE TRUNCATION (2026-11-09). A trimmed listing under the name that
+  // means "the list" is a complete-looking field holding one row, and the reading that
+  // follows is an absence rather than a trim: a session briefed one fold per round off
+  // exactly this payload, because `continuation` names the page and nothing about the key
+  // said the key had been cut. The continuation sentence is one hop away and reads only to
+  // someone already suspicious; the key is in the field list. The complete case keeps the
+  // old name, so only a truncated page changes shape and every small session is untouched.
+  if (pendingTrimmed && isPlainRecord(automatic)) {
+    automatic.pendingFoldsSample = automatic.pendingFolds;
+    delete automatic.pendingFolds;
+  }
   const marksTrimmed = pendingTrimmed || schedulingTrimmed;
   if (shrink(payload, "sourceMap", "source map row(s)") > 0) payload.sourceMapTruncated = true;
   shrink(payload, "topFolds", "top fold row(s)");

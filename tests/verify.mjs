@@ -7306,7 +7306,14 @@ async function gateStatusPagesAreBounded() {
   assert(Buffer.byteLength(JSON.stringify(markPayload, null, 2), "utf8")
     <= context.CONTEXT_STATUS_RESPONSE_BYTES,
   "A status page carrying the full pending mark set exceeded the hard byte cap");
-  const keptMarks = markPayload.automatic.pendingFolds;
+  // THE KEY CARRIES THE TRUNCATION (2026-11-09). A trimmed list under the name that means
+  // "the list" reads as an absence rather than a trim, so the truncated page renames it and
+  // the complete page does not. Exactly one of the two names is ever present.
+  assert.equal(markPayload.automatic.pendingFolds, undefined,
+    "A trimmed pending list still arrived under the name that means the whole list");
+  assert(Array.isArray(markPayload.automatic.pendingFoldsSample),
+    "A trimmed pending list did not arrive as pendingFoldsSample");
+  const keptMarks = markPayload.automatic.pendingFoldsSample;
   assert(keptMarks.length >= 1 && keptMarks.length < context.MAX_PENDING_MARKS,
     `The pending mark list was not trimmed: ${keptMarks.length} of ${context.MAX_PENDING_MARKS}`);
   // NEWEST KEPT, and the operational copy outranks the accounting copy. Trimming
@@ -7315,7 +7322,7 @@ async function gateStatusPagesAreBounded() {
   assert.equal(keptMarks.at(-1).id, markBulks.at(-1).id,
     "The mark trim kept the oldest marks rather than the newest");
   assert(markPayload.automatic.scheduling.marks.length
-    <= markPayload.automatic.pendingFolds.length,
+    <= markPayload.automatic.pendingFoldsSample.length,
   "The accounting mark list outlasted the operational one");
   assert.equal(typeof markPayload.continuation, "string",
     "A page that trimmed marks carried no continuation marker");
@@ -7336,9 +7343,11 @@ async function gateStatusPagesAreBounded() {
       scheduling: { marks: [] },
     },
   }, null, 0, 2_000);
-  assert.equal(floored.automatic.pendingFolds.length, 1,
+  assert.equal(floored.automatic.pendingFolds, undefined,
+    "The floored page kept the whole-list name on a list it cut to one row");
+  assert.equal(floored.automatic.pendingFoldsSample.length, 1,
     "The mark floor did not hold one row at a cap that cannot pay for it");
-  assert.equal(floored.automatic.pendingFolds[0].id, markBulks.at(-1).id,
+  assert.equal(floored.automatic.pendingFoldsSample[0].id, markBulks.at(-1).id,
     "The floored row was not the newest mark");
   assert(/pending fold row\(s\)/.test(floored.continuation),
     "The floored page did not account for the rows it dropped to hold one");
@@ -13748,11 +13757,15 @@ async function gateFoldNoticeStatesTheApproach() {
     measured: true,
     toolName: "pi_fold_context",
   });
+  // THE POINTER NAMES THE PAGE THAT HOLDS THE ROWS (2026-11-09). It used to say
+  // `{"action":"status"} lists the other N`, true only through that page's continuation field
+  // — and the inline list it lands on is itself bounded to as few as one row, so the notice
+  // counted dozens and pointed at a summary holding one. The single line is cited instead.
   let seatedWhole = 1;
-  while (seatedWhole < 64 && !/lists the other/.test(wideList(seatedWhole))) seatedWhole += 1;
+  while (seatedWhole < 64 && !/lists all/.test(wideList(seatedWhole))) seatedWhole += 1;
   assert(seatedWhole < 64, "The notice never states an omission, at any fold count");
   const whole = wideList(seatedWhole - 1);
-  assert(!/lists the other/.test(whole),
+  assert(!/lists all/.test(whole),
     "The notice claimed an omission on a list it seated whole");
   assert(Buffer.byteLength(whole, "utf8") <= context.FOLD_NOTICE_BYTES,
     `A whole list ran to ${Buffer.byteLength(whole, "utf8")} bytes, past the notice bound`);
@@ -13760,8 +13773,8 @@ async function gateFoldNoticeStatesTheApproach() {
   assert(Buffer.byteLength(cutList, "utf8") <= context.FOLD_NOTICE_BYTES,
     `The bounded notice ran to ${Buffer.byteLength(cutList, "utf8")} bytes, past its own bound`);
   const seatedIds = (cutList.match(/fold_[0-9a-f]{16,}/g) ?? []).length;
-  assert(new RegExp(`lists the other ${seatedWhole - seatedIds}\\.`).test(cutList),
-    `The notice seated ${seatedIds} of ${seatedWhole} folds and miscounted the rest: ${cutList}`);
+  assert(new RegExp(`\\{"action":"status","detail":"marks"\\} lists all ${seatedWhole}\\.`).test(cutList),
+    `The notice seated ${seatedIds} of ${seatedWhole} folds and did not point at the page holding all of them: ${cutList}`);
   // THE STATUS SURVIVES A WIDE BATCH. The list is what gives; the facts are what stay.
   for (const line of ["A commit fires at", "headroom", '"action":"pin"', "frees nothing toward the commit"]) {
     assert(cutList.includes(line),
