@@ -1001,7 +1001,12 @@ export function foldStatusRow(fold: ActiveFold, state: ActiveContextState, snaps
   const interval = foldInterval(fold, state, snapshot);
   const refs = flattenFoldRefs(fold, state);
   const allSourceIds = refs.map((ref) => ref.entryId);
-  const sourceIds = allSourceIds.slice(0, 64);
+  // FOUR IDS, NOT SIXTY-FOUR (2026-11-08). A status row exists to answer "which fold holds
+  // this entry", and any one id answers it: the sourceMap is the lookup, this is the
+  // witness. A 64-id head cost 1,332 bytes of a 4,260-byte row against a 24KB page bound,
+  // so the bound spent its budget truncating rows the caller had explicitly paged for.
+  // sourceCount and sourceIdsTruncated still state the whole truth about what is held.
+  const sourceIds = allSourceIds.slice(0, 4);
   const blocked = refsProtected(refs, state, snapshot);
   const projection = state.expanded.includes(fold.id) ? "expanded" : "folded";
   return {
@@ -1017,16 +1022,16 @@ export function foldStatusRow(fold: ActiveFold, state: ActiveContextState, snaps
     sourceIds,
     sourceCount: allSourceIds.length,
     sourceIdsTruncated: sourceIds.length < allSourceIds.length,
-    sourceSha256: fold.sourceSha256,
     brief: foldBrief(fold, state),
     sourceChars: fold.sourceChars,
+    // ONE ACTION, THE ONE THE ROW'S OWN STATE IMPLIES. The four-key block spent 352 bytes
+    // per row restating `expand`, `refold` and `pin` beside the `primary` that already
+    // names the verb for this row's state, and the top-level `actions` block documents
+    // the whole surface. A row that disagrees with its own state is a bug either way.
     actions: {
       primary: projection === "folded"
         ? { action: "expand", id: fold.id }
         : { action: "refold", id: fold.id },
-      expand: { action: "expand", id: fold.id },
-      refold: { action: "refold", id: fold.id },
-      pin: { action: "pin", ids: [fold.id] },
     },
   };
 }

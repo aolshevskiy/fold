@@ -1189,7 +1189,7 @@ async function gateAutonomousLadder() {
   // it may never produce is a fold of anything else.
   assert(toolState.folds.every((fold) => ["tool-result", "chapter"].includes(fold.kind)),
     JSON.stringify(toolState.folds.map((fold) => fold.kind)));
-  const toolRuntimeStatus = await toolStatus(toolRuntime);
+  const toolRuntimeStatus = await toolStatus(toolRuntime, "pi_fold_context", "diagnostics");
   assert.equal(toolRuntimeStatus.details.automatic.lastAutomaticAction.kind, "epoch-commit");
   const structuralBefore = toolRuntime.appended.filter((entry) =>
     entry.customType === context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY).length;
@@ -1286,14 +1286,14 @@ async function gateAutonomousLadder() {
   await startRuntime(chapterRuntime);
   await measure(chapterRuntime, 244_800, 272_000);
   await settle();
-  const preparedStatus = await toolStatus(chapterRuntime);
+  const preparedStatus = await toolStatus(chapterRuntime, "pi_fold_context", "diagnostics");
   assert.equal(preparedStatus.details.automatic.pressureRatio, 0.90);
   assert.equal(typeof preparedStatus.details.automatic.preparedFoldId, "string");
   assert.equal(preparedStatus.details.automatic.lastAutomaticAction, null);
   const fenceTokens = 272_000 - context.ACTIVE_CONTEXT_POLICY.responseReserve;
   const preparedId = preparedStatus.details.automatic.preparedFoldId;
   await measureAndCommit(chapterRuntime, fenceTokens, 272_000, "fence-commit");
-  const chapterStatus = await toolStatus(chapterRuntime);
+  const chapterStatus = await toolStatus(chapterRuntime, "pi_fold_context", "diagnostics");
   // The prepared chapter reaches the window through the SAME commit every other fold
   // takes: the epoch applies it as a mark, so the action is the commit and the fold is
   // the one that was warmed.
@@ -2000,7 +2000,7 @@ async function gateQuietWarming() {
     "A preparation started below prepareRatio");
   await measure(warm, Math.round(0.91 * WINDOW), WINDOW);
   await settle(8);
-  const warmedStatus = await toolStatus(warm);
+  const warmedStatus = await toolStatus(warm, "pi_fold_context", "diagnostics");
   let warmState = materialized(warm);
   assert(warmState.prepared, JSON.stringify(warmedStatus.details.automatic));
   assert.equal(warmState.folds.length, 0);
@@ -3109,7 +3109,7 @@ async function gateEpochQuotaTopUp() {
   assert.equal((await frontierCuts(runtime)).filter((fold) => fold.briefed).length, 1);
 
   await measureAndCommit(runtime, 88_500, 100_000, "quota-round");
-  const status = await toolStatus(runtime);
+  const status = await toolStatus(runtime, "pi_fold_context", "diagnostics");
   // Inside the rewrite the commit already paid for, one further rung may follow it, so
   // the ACTION reported last is not always the commit. The epoch record is, and that is
   // what this gate reads: it rides on every action the pass produced.
@@ -3574,7 +3574,8 @@ async function gateProjectionInstrumentation() {
   );
   await startRuntime(paged);
   for (let index = 0; index < 90; index += 1) await project(paged);
-  const grown = (await toolStatus(paged)).details.automatic.instrumentation;
+  const grown = (await toolStatus(paged, "pi_fold_context", "diagnostics"))
+    .details.automatic.instrumentation;
   assert(grown.projections > 64,
     `The runtime recorded ${grown.projections} projections, too few to outgrow the deleted bound`);
   // The page really trims rather than merely fitting: it holds fewer records than the
@@ -3683,7 +3684,7 @@ async function gateStatusIndexDiet() {
 
   // The full tree stays reachable, explicitly and paged, and never auto-injected.
   const schema = [...lean.tools.values()][0].parameters.properties.detail.enum;
-  assert.deepEqual([...schema], ["fold_candidates", "tree", "folds", "objects"]);
+  assert.deepEqual([...schema], ["fold_candidates", "tree", "folds", "objects", "diagnostics"]);
   assert(pagedFolds.folds.length >= 1);
   assert.equal(pagedFolds.index, undefined);
   assert.deepEqual(
@@ -3704,14 +3705,43 @@ async function gateStatusIndexDiet() {
   assert(pagedObjects.objects.length >= 1);
   assert(Array.isArray((await toolStatus(lean, "pi_fold_context", "tree")).details.tree));
 
+  // THE DIAGNOSTIC BLOCK IS A PAGE, NOT A TAX (2026-11-08). The ledger's three arrays and
+  // the last epoch's receipt were 21KB of a 37KB page, and the byte bound's first act was
+  // to truncate the rows the caller had paged for so that history nobody asked for could
+  // ride along. They answer "why did the runtime do that", asked deliberately, so they
+  // live on a deliberate page and are ABSENT from the one an agent reads by habit.
+  for (const leanPage of [leanStatus, pagedFolds]) {
+    assert.equal(Object.hasOwn(leanPage.automatic.instrumentation, "projectionRecords"), false,
+      "The default status page still carries the projection record array");
+    assert.equal(Object.hasOwn(leanPage.automatic.instrumentation, "cacheObservations"), false,
+      "The default status page still carries the cache observation array");
+    assert.equal(Object.hasOwn(leanPage.automatic.instrumentation, "events"), false,
+      "The default status page still carries the event array");
+    assert.equal(Object.hasOwn(leanPage.automatic, "lastAutomaticAction"), false,
+      "The default status page still carries the epoch receipt");
+    assert.equal(leanPage.automatic.instrumentation.enabled, true,
+      "The lean page dropped the ledger summary with the arrays");
+    assert.equal(typeof leanPage.automatic.instrumentation.projections, "number",
+      "The lean page dropped the ledger counts with the arrays");
+  }
+  const diagnostic = (await toolStatus(lean, "pi_fold_context", "diagnostics")).details;
+  assert(Array.isArray(diagnostic.automatic.instrumentation.projectionRecords),
+    "The diagnostics page does not carry the projection record array");
+  assert(Array.isArray(diagnostic.automatic.instrumentation.events),
+    "The diagnostics page does not carry the event array");
+  assert(Object.hasOwn(diagnostic.automatic, "lastAutomaticAction"),
+    "The diagnostics page does not carry the epoch receipt");
+  assert(diagnostic.automatic.pendingFolds.length === leanStatus.automatic.pendingFolds.length,
+    "The diagnostics page disagrees with the lean page about the foldable marks");
+
   // The paged details are part of the surface, and an unknown one still names the set.
   assert.deepEqual(
     [...[...lean.tools.values()][0].parameters.properties.detail.enum],
-    ["fold_candidates", "tree", "folds", "objects"],
+    ["fold_candidates", "tree", "folds", "objects", "diagnostics"],
   );
   await assert.rejects(
     () => toolCall(lean, { action: "status", detail: "everything" }),
-    /status detail must be one of 'fold_candidates', 'tree', 'folds', 'objects'/,
+    /status detail must be one of 'fold_candidates', 'tree', 'folds', 'objects', 'diagnostics'/,
   );
 
   return {
@@ -4067,7 +4097,8 @@ async function gateEpochInlineRungs() {
     // Full request cycles: the refold decision lands as a mark on any pass, and the
     // commit that applies it runs at the boundary.
     await measureAndCommit(runtime, 86_200 + step * 100, 100_000);
-    const action = (await toolStatus(runtime)).details.automatic.lastAutomaticAction;
+    const action = (await toolStatus(runtime, "pi_fold_context", "diagnostics"))
+      .details.automatic.lastAutomaticAction;
     kinds.push(action.kind);
     if (!materialized(runtime).expanded.includes(target)) break;
   }
@@ -4299,7 +4330,8 @@ async function gatePinnedMassBackstop() {
   await startRuntime(runtime);
   for (const tokens of [76_000, 78_000, 80_000]) await measure(runtime, tokens, 100_000);
   await measureAndCommit(runtime, 88_500, 100_000);
-  const epoch = (await toolStatus(runtime)).details.automatic.lastAutomaticAction?.epoch;
+  const epoch = (await toolStatus(runtime, "pi_fold_context", "diagnostics"))
+    .details.automatic.lastAutomaticAction?.epoch;
   assert(epoch, "The pressure backstop did not commit");
   // The FENCE commits this one, not the boundary: 88,500 tokens of declared occupancy
   // against a 90,000-token serving budget is a crowded projection, and the fence is the
@@ -4567,7 +4599,8 @@ async function gateProjectionBudgetFence() {
   }
 
   // The reduction ran at fence pressure: it applied marks and held NOTHING back.
-  const epoch = (await toolStatus(runtime)).details.automatic.lastAutomaticAction?.epoch;
+  const epoch = (await toolStatus(runtime, "pi_fold_context", "diagnostics"))
+    .details.automatic.lastAutomaticAction?.epoch;
   assert(epoch, "The over-budget path never opened a commit epoch");
   assert(epoch.appliedMarks >= 1, "The fence-level commit applied nothing");
   assert.equal(epoch.retainedMarks, 0, "The fence left marks retained while the request would not fit");
@@ -5207,7 +5240,8 @@ async function gateFenceMarginAndDepth() {
     await measure(deep, 86_000 + step * 100, 100_000);
     projections.push(bytesOf((await project(deep)).messages));
     await settle();
-    const action = (await toolStatus(deep)).details.automatic.lastAutomaticAction;
+    const action = (await toolStatus(deep, "pi_fold_context", "diagnostics"))
+      .details.automatic.lastAutomaticAction;
     const epochKey = action?.epoch ? json.stableStringify(action.epoch) : null;
     if (epochKey && epochKey !== previousEpochKey) {
       epochs.push(action.epoch);
@@ -5490,7 +5524,8 @@ async function gateBandTopCommits() {
   // null ratio, which arms the depth bound; the fence and the boundary carry a ratio
   // and no bound, because something has already gone wrong there. The guard-waiver
   // vocabulary the receipt used to carry is gone with the guard (2026-08-23).
-  const epoch = (await toolStatus(runtime)).details.automatic.lastAutomaticAction?.epoch;
+  const epoch = (await toolStatus(runtime, "pi_fold_context", "diagnostics"))
+    .details.automatic.lastAutomaticAction?.epoch;
   assert(epoch, "The band-top commit left no epoch record");
   assert.equal(epoch.waivedMarks, undefined,
     "The receipt still carries guard-waiver vocabulary; the guard and its waiver are deleted");
@@ -6167,7 +6202,8 @@ async function gateContextEventStream() {
     typeof record.provider === "string" && typeof record.message_sha256 === "string"));
 
   // The in-memory view and the durable stream are the same records, not two conventions.
-  const summary = (await toolStatus(runtime)).details.automatic.instrumentation;
+  const summary = (await toolStatus(runtime, "pi_fold_context", "diagnostics"))
+    .details.automatic.instrumentation;
   await settle();
   assert.equal(stream().length, summary.contextEvents + 1,
     "The durable stream and the ledger disagree about how many events were emitted");
@@ -6994,32 +7030,39 @@ async function gateStatusPagesAreBounded() {
   const allFoldIds = materialized(runtime).folds.map((fold) => fold.id).sort();
   assert(allFoldIds.length >= 10, "The fixture built too few folds to force paging");
 
-  // Every detail variant fits the cap, and the marker appears on every truncated page.
+  // Every detail variant fits the cap, and a marker that appears is one line.
+  //
+  // THE MARKER IS NO LONGER MANDATORY ON EVERY VARIANT (2026-11-08). The diagnostic block
+  // moved behind `detail: "diagnostics"`, so the pages an agent reads by habit are lean
+  // enough to be delivered whole and carry no continuation at all. Demanding a marker on
+  // every variant would now be demanding that the lean pages still truncate, which is the
+  // defect the move removes. Presence is asserted exactly where truncation is forced: the
+  // listing walks below, and the small-session block below that states the converse.
   const measured = {};
-  let receiptTrimSeen = 0;
-  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects"]) {
+  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "diagnostics"]) {
     const result = await toolStatus(runtime, "pi_fold_context", detail);
     const delivered = Buffer.byteLength(result.content[0].text, "utf8");
     assert(delivered <= context.CONTEXT_STATUS_RESPONSE_BYTES,
       `status detail=${detail ?? "default"} delivered ${delivered} bytes over the cap`);
-    assert.equal(typeof result.details.continuation, "string",
-      `status detail=${detail ?? "default"} truncated without a continuation marker`);
-    assert.equal(result.details.continuation.includes("\n"), false,
-      "The continuation marker is not one line");
-    // A trimmed receipt row has no page, and the continuation must never point
-    // at one: "full lists stay reachable" beside dropped receipt rows sent the
-    // agent to a page that does not exist.
-    if (result.details.continuation.includes("receipt row(s)")) {
-      receiptTrimSeen += 1;
-      assert(result.details.continuation.includes("the trimmed rows have no page"),
-        `detail=${detail ?? "default"} trimmed receipt rows without saying they have no page`);
-      assert.equal(result.details.continuation.includes("full lists stay reachable"), false,
-        `detail=${detail ?? "default"} claimed full reachability over trimmed receipt rows`);
+    if (result.details.continuation !== undefined) {
+      assert.equal(typeof result.details.continuation, "string",
+        `status detail=${detail ?? "default"} carried a non-string continuation`);
+      assert.equal(result.details.continuation.includes("\n"), false,
+        "The continuation marker is not one line");
+      // A trimmed receipt row has no page, and the continuation must never point
+      // at one: "full lists stay reachable" beside dropped receipt rows sent the
+      // agent to a page that does not exist. Receipt rows are trimmed LAST, and only
+      // once the ledger arrays have been given up, so this wording is reachable only
+      // on the diagnostics page; the rule is guarded wherever the wording can fire.
+      if (result.details.continuation.includes("receipt row(s)")) {
+        assert(result.details.continuation.includes("the trimmed rows have no page"),
+          `detail=${detail ?? "default"} trimmed receipt rows without saying they have no page`);
+        assert.equal(result.details.continuation.includes("full lists stay reachable"), false,
+          `detail=${detail ?? "default"} claimed full reachability over trimmed receipt rows`);
+      }
     }
     measured[detail ?? "default"] = delivered;
   }
-  assert(receiptTrimSeen > 0,
-    "No page trimmed receipt rows, so the no-page wording was never exercised");
 
   // Paging through the continuation offsets yields every fold id exactly once, for
   // both fold listings; the object listing pages completely the same way.
@@ -7045,7 +7088,7 @@ async function gateStatusPagesAreBounded() {
   // whole and unmarked.
   const small = makeRuntime(makeFixture({ turns: 2, resultChars: 400, contextWindow: 100_000 }));
   await startRuntime(small);
-  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects"]) {
+  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "diagnostics"]) {
     const result = await toolStatus(small, "pi_fold_context", detail);
     assert(Buffer.byteLength(result.content[0].text, "utf8") <= context.CONTEXT_STATUS_RESPONSE_BYTES);
     assert.equal(result.details.continuation, undefined,

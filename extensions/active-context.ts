@@ -4526,13 +4526,21 @@ export function registerActiveContext(pi: any, options: {
     const snapshot = authoritativeSnapshotFor(ctx);
     if (action === "status") {
       const detail = ownValue(params, "detail");
-      const details = ["fold_candidates", "tree", "folds", "objects"];
+      const details = ["fold_candidates", "tree", "folds", "objects", "diagnostics"];
       if (detail !== undefined && !details.includes(String(detail))) {
         throw new Error(`status detail must be one of ${details.map((name) => `'${name}'`).join(", ")}`);
       }
       const statusOffset = boundedInteger(params.offset, 0, 0, 1_000_000, "offset");
       const statusLimit = boundedInteger(params.limit, 40, 1, 100, "limit");
       const paged = detail === "folds" || detail === "objects";
+      // THE DIAGNOSTIC BLOCK IS A PAGE, NOT A TAX (2026-11-08). `instrumentation`'s three
+      // arrays and the last epoch's receipt were 21,233 of a 37,776-byte diet page and
+      // 33,333 of an 85,532-byte folds page, and the byte bound's first act was therefore
+      // to truncate the very rows the caller asked for in order to make room for history
+      // nobody had requested. They answer "why did the runtime do that", which is a
+      // question asked deliberately, so they now answer it on a deliberate page. The
+      // summary counts stay inline: knowing the ledger is running is not expensive.
+      const diagnosticsPage = detail === "diagnostics";
       const accounting = markAccounting(snapshot, persistence.state);
       return toolPayload(boundStatusPayload({
         ...activeContextStatus(
@@ -4583,7 +4591,7 @@ export function registerActiveContext(pi: any, options: {
           boundaryFailure: ladder.boundaryFailure,
           lastSelectionKind: ladder.lastSelectionKind,
           lastSelectionSourceIds: ladder.lastSelectionSourceIds,
-          lastAutomaticAction: ladder.lastAutomaticAction,
+          ...(diagnosticsPage ? { lastAutomaticAction: ladder.lastAutomaticAction } : {}),
           overBudgetReduction: ladder.overBudgetReduction ? clone(ladder.overBudgetReduction) : null,
           curation: {
             occupancyThreshold: thresholds.maxTarget,
@@ -4639,9 +4647,11 @@ export function registerActiveContext(pi: any, options: {
           instrumentation: {
             enabled: true,
             ...ledgerSummary(instrumentation.ledger),
-            projectionRecords: clone(instrumentation.ledger.records),
-            cacheObservations: clone(instrumentation.ledger.observations),
-            events: clone(instrumentation.ledger.events),
+            ...(diagnosticsPage ? {
+              projectionRecords: clone(instrumentation.ledger.records),
+              cacheObservations: clone(instrumentation.ledger.observations),
+              events: clone(instrumentation.ledger.events),
+            } : {}),
           },
           peek: {
             defaultMaxBytes: PEEK_DEFAULT_MAX_BYTES,
@@ -5414,7 +5424,7 @@ export function registerActiveContext(pi: any, options: {
     allowedActions: allowedToolActions,
     fullSurface: true,
     maxBriefChars: ACTIVE_CONTEXT_POLICY.agentBriefReserve,
-    statusDetails: ["fold_candidates", "tree", "folds", "objects"],
+    statusDetails: ["fold_candidates", "tree", "folds", "objects", "diagnostics"],
     minPeekSliceBytes: PEEK_MIN_SLICE_BYTES,
     defaultPeekBytes: PEEK_DEFAULT_MAX_BYTES,
     handler: toolHandler,
