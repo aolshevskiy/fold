@@ -14,3 +14,13 @@ lab/
 memory/
 *.local.*
 __pycache__/
+
+# Bun is the lockfile of record and `bun.lock` is tracked. npm's lockfile is not: two
+# lockfiles resolving one tree is two answers to one question, and the npm one had been
+# tracked only because `npm install` writes what it writes.
+#
+# CONSEQUENCE, UNFIXED ON PURPOSE: `.github/workflows/ci.yml` still runs `npm ci` and
+# `require('./package-lock.json')` to pin the measured pi runtime, and both need the file
+# this ignores. CI is broken for this fork until that workflow moves to bun; the line here
+# does not make it work, it keeps a stray `npm install` from silently re-adding the file.
+package-lock.json

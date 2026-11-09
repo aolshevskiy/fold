@@ -82,6 +82,14 @@ export function buildActiveContextTool(input: {
           minimum: input.minPeekSliceBytes,
           description: `Peek only: bytes of the plain-text history view to return, widening or narrowing the ${input.defaultPeekBytes}-byte default.`,
         },
+        briefOnly: {
+          type: "boolean",
+          description: "Peek only: return the fold's brief, kind, depth, child count and " +
+            "sizes WITHOUT its source or its descendant index. The cheap read: a listing " +
+            "row no longer repeats a brief, so this is how you read one, at a cost of " +
+            "tokens rather than a window of source. Use a plain peek or expand when you " +
+            "want the evidence itself.",
+        },
         limit: { type: "integer", minimum: 1, maximum: 100 },
         detail: { type: "string", enum: [...input.statusDetails] },
       },

@@ -4679,6 +4679,13 @@ export function registerActiveContext(pi: any, options: {
       if (params.ephemeral !== undefined && typeof params.ephemeral !== "boolean") {
         throw new Error("peek ephemeral must be a boolean");
       }
+      // THE BRIEF READS THE STATE, NOT THE SOURCE (2026-11-09). See peekFoldSource: this
+      // mode exists so a listing row need not carry a summary it may already be sitting
+      // next to, and it must never fall through into exact recovery or the admission
+      // fence that governs source bytes, because it admits none.
+      if (params.briefOnly !== undefined && typeof params.briefOnly !== "boolean") {
+        throw new Error("peek briefOnly must be a boolean");
+      }
       const offset = boundedInteger(params.offset, 0, 0, 1_000_000_000, "offset");
       const sliceBytes = boundedInteger(
         params.bytes,
@@ -4722,6 +4729,21 @@ export function registerActiveContext(pi: any, options: {
           });
         }
         throw new Error(`Unknown active-context fold ${id}`);
+      }
+      // A BRIEF-ONLY READ ADMITS NO SOURCE, so it does not pass the fence that governs
+      // source: `admit` exists to bound and account the bytes a read puts back into the
+      // window, and this read puts back none. Running it here would charge a fence for a
+      // result whose whole purpose is to cost nothing.
+      if (params.briefOnly === true) {
+        return toolPayload(peekFoldSource({
+          foldId: id,
+          state: persistence.state,
+          entries: ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch(),
+          sessionId: ctx.sessionManager.getSessionId(),
+          offset,
+          toolName,
+          briefOnly: true,
+        }));
       }
       admit({
         action: "peek",

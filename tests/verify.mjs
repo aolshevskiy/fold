@@ -2392,6 +2392,36 @@ async function gatePeekAndFoldIndex() {
   assert.equal(json.stableStringify(durableEntries(runtime.branch)), branchBefore);
   assert.equal(durableEntries(runtime.appended).length, appendedBefore);
 
+  // A BRIEF-ONLY READ IS NOT A PEEK AND MUST NOT COST ONE (2026-11-09). Listings stopped
+  // repeating briefs, so this is the read that replaces them: state only, no source, no
+  // descendant index, no exact recovery. It must move nothing — the same identity the
+  // full peek above preserves — and it must be an order of magnitude smaller than the
+  // peek of the same fold, or it is not the read that made the listings cheap.
+  const briefRead = await runtime.tools.get("pi_fold_context").execute(
+    "peek-brief",
+    { action: "peek", id: childId, briefOnly: true },
+    new AbortController().signal,
+    undefined,
+    runtime.ctx,
+  );
+  const briefDetails = briefRead.details;
+  assert.equal(briefDetails.mode, "brief");
+  const briefedFold = seeded.folds.find((fold) => fold.id === childId);
+  assert.equal(briefDetails.brief, context.foldBrief(briefedFold, seeded),
+    "The brief-only read disagreed with the state about the fold's brief");
+  assert.equal(Object.hasOwn(briefDetails, "source"), false,
+    "A brief-only read carried the source view a peek exists to deliver");
+  assert.equal(Object.hasOwn(briefDetails, "index"), false,
+    "A brief-only read carried the descendant index");
+  assert.equal(Object.hasOwn(briefDetails, "sourceFormat"), false);
+  assert.equal(json.stableStringify(context.projectActiveContext(forest.snapshot, materialized(runtime))),
+    projectionBefore, "A brief-only read changed the projection");
+  assert.equal(durableEntries(runtime.appended).length, appendedBefore,
+    "A brief-only read appended to the branch");
+  assert(Buffer.byteLength(JSON.stringify(briefDetails), "utf8")
+    < Buffer.byteLength(JSON.stringify(peek.details), "utf8"),
+  "The brief-only read was not smaller than the peek it replaces");
+
   const childFold = seeded.folds.find((fold) => fold.id === childId);
   const restored = context.renderFold(
     childFold,
@@ -2467,7 +2497,16 @@ async function gatePeekAndFoldIndex() {
     [chapterIds[0], 1, consolidationId, "folded", true],
     [chapterIds[1], 1, consolidationId, "folded", true],
   ]);
-  assert(tree.every((row) => row.brief && row.sourceCount > 0 && row.kind));
+  // THE ROW IS STRUCTURE (2026-11-09). A listing row no longer carries a brief: the
+  // placeholder already renders it for every fold in the window, and for a nested child
+  // the brief comes from `peek briefOnly`, which reads state instead of source. What the
+  // row must carry instead is enough to LOCATE the fold — its interval and its sizes.
+  assert(tree.every((row) => !Object.hasOwn(row, "brief") &&
+    row.sourceCount > 0 && row.kind && typeof row.startId === "string" &&
+    typeof row.endId === "string" && Number.isSafeInteger(row.startPosition)),
+  "A tree row is opaque: it carries neither a brief nor the interval that replaces one");
+  assert(tree.every((row) => row.briefVia?.action === "peek" && row.briefVia?.briefOnly === true),
+    "A tree row does not name the read that returns its brief");
   assert.deepEqual(
     context.visibleCollapsedFolds(seeded, forest.snapshot).map((fold) => fold.id),
     [consolidationId],
@@ -3691,17 +3730,29 @@ async function gateStatusIndexDiet() {
     pagedFolds.folds.map((row) => row.id),
     fatStatus.folds.map((row) => row.id),
   );
-  // A paged row must carry the brief, or paging the tree returns opaque ids and the
-  // agent is pushed straight back into the whole-fold peek the diet exists to avoid.
-  // The tree is read through its bounded pages, which is how an agent now reads it.
+  // A PAGED ROW MUST NOT CARRY THE BRIEF, AND MUST NOT BE OPAQUE EITHER (2026-11-09).
+  // The old law here demanded a brief per row, on the reasoning that paging the tree to
+  // opaque ids pushes the agent straight back into a whole-fold peek. The reasoning is
+  // still sound; the remedy was the expensive one. A brief per row repeats text the
+  // placeholder already put in the window, and at 142 folds it was ~260KB across a dozen
+  // pages. The row now locates the fold instead — interval, counts, sizes — and the brief
+  // is read by id at state cost. Both listings carry the same shape, because both builders
+  // spread `foldListingCore`.
   const tree = (await pagedStatusRows(lean, "tree")).rows;
-  const treeBriefs = new Map(tree.map((row) => [row.id, row.brief]));
-  assert(pagedFolds.folds.every((row) => typeof row.brief === "string" && row.brief.length >= 1),
-    "A paged fold row carries no brief");
-  assert(pagedFolds.folds.every((row) => row.brief === treeBriefs.get(row.id)),
-    "A paged fold row disagrees with the tree row about the brief");
+  const treeById = new Map(tree.map((row) => [row.id, row]));
+  assert(pagedFolds.folds.every((row) => !Object.hasOwn(row, "brief")),
+    "A paged fold row still carries a brief");
+  assert(tree.every((row) => !Object.hasOwn(row, "brief")),
+    "A tree row still carries a brief");
+  assert(pagedFolds.folds.every((row) => {
+    const peer = treeById.get(row.id);
+    return peer && peer.startId === row.startId && peer.endId === row.endId &&
+      peer.startPosition === row.startPosition && peer.endPosition === row.endPosition;
+  }), "A paged fold row disagrees with the tree row about where the fold sits");
   assert(pagedFolds.folds.every((row) => Number.isSafeInteger(row.sourceChars) && row.sourceChars > 0),
     "A paged fold row carries no sourceChars");
+  assert(pagedFolds.folds.every((row) => typeof row.startId === "string" && typeof row.endId === "string"),
+    "A paged fold row carries no interval, so it is an opaque id");
   assert(pagedObjects.objects.length >= 1);
   assert(Array.isArray((await toolStatus(lean, "pi_fold_context", "tree")).details.tree));
 
@@ -3749,7 +3800,12 @@ async function gateStatusIndexDiet() {
     pagedStatusBytes: Buffer.byteLength(pagedFoldsResult.content[0].text, "utf8"),
     dietStatusBytes: Buffer.byteLength(leanResult.content[0].text, "utf8"),
     statusByteCap: context.CONTEXT_STATUS_RESPONSE_BYTES,
-    pagedBriefs: pagedFolds.folds.length,
+    // Named for what it counts: BEFORE 2026-11-09 this reported rows and was read as
+    // briefs, which is how a listing that carried one per row looked like a success.
+    pagedBriefs: pagedFolds.folds.filter((row) => Object.hasOwn(row, "brief")).length,
+    pagedRows: pagedFolds.folds.length,
+    pagedRowsWithInterval: pagedFolds.folds.filter((row) =>
+      typeof row.startId === "string" && Number.isSafeInteger(row.startPosition)).length,
     topFolds: leanStatus.topFolds.length,
     sourceMapEntries: leanStatus.sourceMap.length,
     pagedFoldsMatchDefault: true,
@@ -7072,12 +7128,31 @@ async function gateStatusPagesAreBounded() {
   const walks = {};
   for (const detail of ["folds", "tree"]) {
     const { rows, pages } = walks[detail] = await pagedStatusRows(runtime, detail);
-    assert(pages.length >= 2, `detail=${detail} never needed a second page`);
     assert(pages.every((page) => page.bytes <= context.CONTEXT_STATUS_RESPONSE_BYTES));
     const ids = rows.map((row) => row.id);
     assert.equal(ids.length, new Set(ids).size, `detail=${detail} paged a fold id twice`);
     assert.deepEqual([...ids].sort(), allFoldIds, `detail=${detail} paging lost a fold id`);
   }
+  // THE INDEX FITS ONE PAGE NOW (2026-11-09) — that is the project, stated as a number.
+  // Rows lost their briefs and gained an interval, so 26 folds of structure are a few KB
+  // where 26 folds of narration were a dozen pages. The previous form of this gate
+  // REQUIRED a second page, which was true of the old rows and is the state this change
+  // exists to end; demanding it now would demand the defect back.
+  assert.equal(walks.tree.pages.length, 1,
+    `The whole tree index took ${walks.tree.pages.length} pages of structure`);
+  // The paging machinery itself still works, proven against the OFFSETS rather than
+  // against mass: `tree` carries no row limit (it pages from its offset and ends), so the
+  // honest check is that an offset returns exactly the rows past it, not that a limit is
+  // honoured by a detail that never had one.
+  const shifted = await runtime.tools.get("pi_fold_context").execute(
+    "shifted-tree",
+    { action: "status", detail: "tree", offset: 5 },
+    new AbortController().signal,
+    undefined,
+    runtime.ctx,
+  );
+  assert.equal(shifted.details.tree.length, allFoldIds.length - 5,
+    "A tree request at an offset did not return exactly the rows past it");
   const objectsWalk = await pagedStatusRows(runtime, "objects");
   const objectIds = objectsWalk.rows.map((row) => row.id);
   assert.equal(objectIds.length, new Set(objectIds).size, "objects paging repeated a row");
@@ -7100,6 +7175,76 @@ async function gateStatusPagesAreBounded() {
   assert.equal(diet.paging.note, "Results are delivered in bounded pages.");
   assert.equal(/—/.test(JSON.stringify(diet)), false, "An em dash reached the status surface");
 
+  // WHAT KEEPS ITS BRIEF (2026-11-09). Listings stopped narrating; three surfaces did not,
+  // and each for a stated reason. A change that quietly stripped these too would look like
+  // strict success on every byte assertion above, so the exclusion is pinned here rather
+  // than left to be noticed.
+  //
+  // (a) The projection placeholder: the brief the agent reads without asking for one.
+  const liveSnapshot = runtime.built.snapshot;
+  const liveState = materialized(runtime);
+  assert(liveState.folds.length >= 1);
+  for (const visibleFold of context.visibleCollapsedFolds(liveState, liveSnapshot).slice(0, 3)) {
+    const placeholder = context.foldPlaceholder(visibleFold, liveState, liveSnapshot);
+    assert(placeholder.includes(context.foldBrief(visibleFold, liveState)),
+      `The placeholder for ${visibleFold.id} dropped the brief and left the window unable to answer`);
+  }
+  // (b) The topFolds shortlist: bounded at STATUS_DIET_INDEX_ROWS, so a brief here is a
+  // constant rather than a cost that grows with the session.
+  assert(diet.topFolds.length <= context.STATUS_DIET_INDEX_ROWS);
+  assert(diet.topFolds.every((row) => typeof row.brief === "string" && row.brief.length >= 1),
+    "The shortlist lost the brief that makes it a shortlist");
+  // (c) pendingFolds is pinned where marks exist — `gateNoFoldWithoutABrief`, whose
+  // fixture cuts a frontier and therefore has a mark list to read. This gate's fixture
+  // commits everything, so asserting it here would pass on an empty array.
+
+  // THE MARK LIST WAS THE ONE ARRAY NOBODY BOUNDED (2026-11-09). MAX_PENDING_MARKS is 256
+  // and a brief can be maxBriefChars 2,000, so a session that accumulated marks without
+  // committing could deliver half a megabyte against a 24KB cap — and `scheduling.marks`
+  // carried the same marks with the same briefs beside `pendingFolds`. Neither array was
+  // in the shrink order, so the bound trimmed other people's paged rows while this mass
+  // rode free: the rep-19 shape, one serialization over.
+  const markBulks = Array.from({ length: context.MAX_PENDING_MARKS }, (_unused, index) => ({
+    id: `fold_bulk${String(index).padStart(6, "0")}`,
+    kind: "chapter",
+    tokens: 1_000 + index,
+    briefed: false,
+    brief: `${index} `.padEnd(2_000, "x"),
+    briefProvenance: { kind: "deterministic" },
+  }));
+  const markPayload = context.boundStatusPayload({
+    version: 1,
+    automatic: {
+      pendingFolds: markBulks,
+      scheduling: {
+        marks: markBulks.map((mark) => ({
+          mark: "fold", id: mark.id, origin: "ladder", ordinal: 1,
+          eligibility: "eligible", kind: mark.kind, brief: mark.brief,
+        })),
+      },
+    },
+  }, null, 0);
+  assert(Buffer.byteLength(JSON.stringify(markPayload, null, 2), "utf8")
+    <= context.CONTEXT_STATUS_RESPONSE_BYTES,
+  "A status page carrying the full pending mark set exceeded the hard byte cap");
+  const keptMarks = markPayload.automatic.pendingFolds;
+  assert(keptMarks.length >= 1 && keptMarks.length < context.MAX_PENDING_MARKS,
+    `The pending mark list was not trimmed: ${keptMarks.length} of ${context.MAX_PENDING_MARKS}`);
+  // NEWEST KEPT, and the operational copy outranks the accounting copy. Trimming
+  // `pendingFolds` first would have let the page fit while the list an agent needs ids
+  // from collapsed and the duplicate rode on: the accounting copy gives up its rows first.
+  assert.equal(keptMarks.at(-1).id, markBulks.at(-1).id,
+    "The mark trim kept the oldest marks rather than the newest");
+  assert(markPayload.automatic.scheduling.marks.length
+    <= markPayload.automatic.pendingFolds.length,
+  "The accounting mark list outlasted the operational one");
+  assert.equal(typeof markPayload.continuation, "string",
+    "A page that trimmed marks carried no continuation marker");
+  assert(/pending fold row\(s\)|scheduling mark row\(s\)/.test(markPayload.continuation),
+    `The continuation did not account for the trimmed marks: ${markPayload.continuation}`);
+  assert(markPayload.continuation.includes("older marks stay pending"),
+    "The continuation implied trimmed marks were gone rather than still pending");
+
   return {
     cap: context.CONTEXT_STATUS_RESPONSE_BYTES,
     folds: allFoldIds.length,
@@ -7121,7 +7266,10 @@ async function gateStatusResultsAreLadderFood() {
       peek: [...context.READ_ONLY_CONTEXT_ACTION_ARGUMENTS.peek],
     },
     { status: ["action", "detail", "offset", "limit"],
-      peek: ["action", "id", "offset", "bytes", "ephemeral"] },
+      // briefOnly joins this list for the reason detail did: it is the read that replaced
+      // the mass listings no longer carry, and a parameter left OFF the allowlist makes
+      // the call unsafe, which makes it permanently un-reclaimable (rep 19's failure).
+      peek: ["action", "id", "offset", "bytes", "ephemeral", "briefOnly"] },
   );
   const pagedShape = { action: "status", detail: "folds", offset: 40, limit: 40 };
   assert.equal(context.isAutoFoldableToolCall("pi_fold_context", pagedShape), true,
@@ -10638,6 +10786,22 @@ async function gateNoFoldWithoutABrief() {
       "A deterministic fill was recorded as though the agent had written it");
     assert.equal(cut.briefed, false);
   }
+
+  // THE MARK LIST KEEPS ITS BRIEFS (2026-11-09). Listings stopped carrying briefs because
+  // a visible fold's brief is already in the window; a PENDING mark is not in the window at
+  // all, so its brief is the only thing that tells an agent what it is about to commit. It
+  // is bounded by the mark list's trim, never stripped.
+  const markPage = (await toolStatus(runtime, "pi_fold_context", "diagnostics")).details;
+  assert(markPage.automatic.pendingFolds.length >= 1,
+    "The fixture cut marks but the page listed none");
+  assert(markPage.automatic.pendingFolds.every((mark) =>
+    typeof mark.brief === "string" && mark.brief.length >= 1),
+  "A pending mark reached the page without the brief an agent briefs it with");
+  const cutById = new Map(cuts.map((cut) => [cut.id, cut]));
+  assert(markPage.automatic.pendingFolds.every((mark) => {
+    const cut = cutById.get(mark.id);
+    return !cut || mark.brief === cut.brief;
+  }), "The page and the runtime disagree about a pending mark's brief");
 
   // SUPPLIED: kept verbatim, and it REPLACES the deterministic fill rather than joining it.
   const supplied = "The second inspection is stale; its exact stdout and the failing path stay recoverable.";

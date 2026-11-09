@@ -129,7 +129,10 @@ export const READ_ONLY_CONTEXT_ACTION_ARGUMENTS: Readonly<Record<string, readonl
   // ephemeral joins them for the same reason: it changes when the RESULT leaves
   // the projection, never what the call moves, and a call the reclaimer cannot
   // claim would linger as exactly the mass the parameter exists to shed.
-  peek: Object.freeze(["action", "id", "offset", "bytes", "ephemeral"]),
+  // briefOnly joins them for the same reason, and for one more: it is the read that
+  // REPLACES the mass removed from status listings, so a brief-only call the reclaimer
+  // could not classify would put the reclaimed bytes straight back as raw mass.
+  peek: Object.freeze(["action", "id", "offset", "bytes", "ephemeral", "briefOnly"]),
 });
 
 export function isAutoFoldableToolCall(

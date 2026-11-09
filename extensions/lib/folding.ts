@@ -996,6 +996,46 @@ function applyToolClips(
   }
 }
 
+/**
+ * THE ONE STATEMENT OF WHAT A LISTING ROW IS (2026-11-09).
+ *
+ * Three builders emit fold rows — `folds`, `tree` and the `topFolds` shortlist — and
+ * before this they each decided for themselves what a row contained, which is how every
+ * one of them came to carry a brief. A brief in a listing row is not free: `foldPlaceholder`
+ * already renders it into the projection for every fold in the window, so the row sends
+ * text the agent is sitting next to, and at 142 folds and ~2,022 bytes a brief the tree
+ * listing was ~260KB across a dozen pages against a 24KB bound.
+ *
+ * The row is therefore STRUCTURE: identity, shape, and WHERE the fold sits. A fold is
+ * located by its window position or by an entry id through the source map, and its brief
+ * is read by id with `peek briefOnly`, which costs state reads rather than a 16KB window
+ * of source. Anything a builder adds on top of this is that builder's own business; the
+ * brief is emphatically not part of it.
+ */
+export function foldListingCore(
+  fold: ActiveFold,
+  state: ActiveContextState,
+  snapshot: ActiveContextSnapshot,
+): Record<string, unknown> {
+  const refs = flattenFoldRefs(fold, state);
+  const interval = foldInterval(fold, state, snapshot);
+  return {
+    id: fold.id,
+    kind: fold.kind,
+    depth: foldDepth(state, fold),
+    state: state.expanded.includes(fold.id) ? "expanded" : "folded",
+    // THE INTERVAL IS WHAT REPLACES THE BRIEF. A row that says where the fold starts and
+    // ends is not opaque: it is locatable against the window and against an entry id,
+    // which is the finding the old assertion protected and this keeps.
+    startId: refs[0]?.entryId ?? null,
+    endId: refs.at(-1)?.entryId ?? null,
+    startPosition: interval?.start ?? null,
+    endPosition: interval?.end ?? null,
+    sourceCount: refs.length,
+    sourceChars: fold.sourceChars,
+  };
+}
+
 export function foldStatusRow(fold: ActiveFold, state: ActiveContextState, snapshot: ActiveContextSnapshot): Record<string, unknown> {
   const navigation = foldNavigation(fold, state, snapshot);
   const interval = foldInterval(fold, state, snapshot);
@@ -1010,20 +1050,15 @@ export function foldStatusRow(fold: ActiveFold, state: ActiveContextState, snaps
   const blocked = refsProtected(refs, state, snapshot);
   const projection = state.expanded.includes(fold.id) ? "expanded" : "folded";
   return {
-    id: fold.id,
-    kind: fold.kind,
+    ...foldListingCore(fold, state, snapshot),
     parent: fold.parentId,
     children: childFoldIds(fold),
     previous: navigation.previous,
     next: navigation.next,
-    state: projection,
     active: Boolean(interval),
     protected: blocked,
     sourceIds,
-    sourceCount: allSourceIds.length,
     sourceIdsTruncated: sourceIds.length < allSourceIds.length,
-    brief: foldBrief(fold, state),
-    sourceChars: fold.sourceChars,
     // ONE ACTION, THE ONE THE ROW'S OWN STATE IMPLIES. The four-key block spent 352 bytes
     // per row restating `expand`, `refold` and `pin` beside the `primary` that already
     // names the verb for this row's state, and the top-level `actions` block documents
@@ -1063,14 +1098,15 @@ export function foldTreeDetail(
   state: ActiveContextState,
 ): Array<Record<string, unknown>> {
   return orderedFoldTree(state, snapshot).map((fold) => ({
-    id: fold.id,
-    kind: fold.kind,
-    depth: foldDepth(state, fold),
+    ...foldListingCore(fold, state, snapshot),
     parentId: fold.parentId,
-    brief: foldBrief(fold, state),
-    sourceCount: flattenFoldRefs(fold, state).length,
-    state: state.expanded.includes(fold.id) ? "expanded" : "folded",
     peekable: true,
+    // NO BRIEF, AND THIS IS THE ROW THAT MATTERS MOST. Parents hide their children, so a
+    // nested child's brief appears nowhere in the window; that made the tree listing look
+    // like the only place to get one, and it is why this listing was the fat one. It is
+    // not the only place: `peek briefOnly` reads the same brief from state for a handful
+    // of tokens, and it works for exactly these folds.
+    briefVia: { action: "peek", id: fold.id, briefOnly: true },
   }));
 }
 
@@ -1079,23 +1115,16 @@ export function foldIndexRow(
   state: ActiveContextState,
   snapshot: ActiveContextSnapshot,
 ): Record<string, unknown> {
-  const refs = flattenFoldRefs(fold, state);
-  const interval = foldInterval(fold, state, snapshot);
   const replacement = renderFold(fold, state, snapshot);
   const source = renderFold(fold, { ...state, expanded: [...state.expanded, fold.id] }, snapshot);
   const reclaimableBytes = replacement && source ? Math.max(0, bytes(source) - bytes(replacement)) : 0;
   return {
-    id: fold.id,
-    kind: fold.kind,
-    depth: foldDepth(state, fold),
-    state: state.expanded.includes(fold.id) ? "expanded" : "folded",
-    startId: refs[0]?.entryId ?? null,
-    endId: refs.at(-1)?.entryId ?? null,
-    startPosition: interval?.start ?? null,
-    endPosition: interval?.end ?? null,
-    sourceCount: refs.length,
-    sourceBytes: fold.sourceChars,
+    ...foldListingCore(fold, state, snapshot),
     reclaimableBytes,
+    // THE ONE BRIEFED LISTING, AND IT IS THE ONE THAT CANNOT GROW. This row set is capped
+    // at STATUS_DIET_INDEX_ROWS (5) and sorted by what committing it would free, so the
+    // brief here costs a constant no matter how many folds a session accumulates. That is
+    // the whole distinction the rule rests on: a shortlist may narrate, a listing may not.
     brief: foldBrief(fold, state),
     peek: { action: "peek", id: fold.id },
     expand: { action: "expand", id: fold.id },
@@ -1242,11 +1271,30 @@ export function boundStatusPayload(
   };
   const automatic = ownValue(payload, "automatic");
   const instrumentation = isPlainRecord(automatic) ? ownValue(automatic, "instrumentation") : undefined;
+  const scheduling = isPlainRecord(automatic) ? ownValue(automatic, "scheduling") : undefined;
   const lastAction = isPlainRecord(automatic) ? ownValue(automatic, "lastAutomaticAction") : undefined;
   const lastEpoch = isPlainRecord(lastAction) ? ownValue(lastAction, "epoch") : undefined;
   shrink(instrumentation, "projectionRecords", "projection record(s)", true);
   shrink(instrumentation, "cacheObservations", "cache observation(s)", true);
   shrink(instrumentation, "events", "context event(s)", true);
+  // THE MARK LIST WAS THE ONE ARRAY NOBODY BOUNDED (2026-11-09). MAX_PENDING_MARKS is
+  // 256 and each mark carries a brief up to maxBriefChars 2,000, so `pendingFolds` alone
+  // reached half a megabyte against a 24KB cap, and `scheduling.marks` carried the SAME
+  // marks with the SAME briefs in the same payload. Neither array was in this shrink
+  // order, so a session that accumulated marks without committing delivered a page the
+  // bound could not make fit: it trimmed other people's rows while this mass rode free.
+  // That is the rep-19 shape exactly, one serialization over. Newest kept, because the
+  // marks closest to the commit are the ones worth briefing; the older ones stay pending
+  // on the runtime and simply do not appear here, which the continuation states.
+  //
+  // THE ORDER IS THE LAW, and it is the opposite of what reads naturally. `scheduling.marks`
+  // is the ACCOUNTING copy of the same marks, so it gives up its rows FIRST; trimming
+  // `pendingFolds` first would let the page "fit" while the operational copy — the one an
+  // agent needs an id from in order to brief — collapsed to nothing and the duplicate rode
+  // on at full size. Nothing here may be kept at another's expense when it is a subset.
+  const schedulingTrimmed = shrink(scheduling, "marks", "scheduling mark row(s)", true) > 0;
+  const pendingTrimmed = shrink(automatic, "pendingFolds", "pending fold row(s)", true) > 0;
+  const marksTrimmed = pendingTrimmed || schedulingTrimmed;
   if (shrink(payload, "sourceMap", "source map row(s)") > 0) payload.sourceMapTruncated = true;
   shrink(payload, "topFolds", "top fold row(s)");
   // The last epoch's receipt lists grow with commit depth (a deep epoch applies dozens
@@ -1282,9 +1330,14 @@ export function boundStatusPayload(
   const pageable = continueAt === null
     ? "the fold, object and tree lists stay reachable through the paged status details"
     : `continue at ${JSON.stringify({ action: "status", detail, offset: continueAt })}`;
-  const resume = receiptRowsDropped
+  const base = receiptRowsDropped
     ? `${pageable}; the epoch receipt keeps only its newest rows and the trimmed rows have no page`
     : (continueAt === null ? "the full lists stay reachable through the paged status details" : pageable);
+  // A trimmed mark is NOT lost and must not be described as if it were: it lives on the
+  // runtime and commits with the epoch. It says so plainly rather than pointing at a page.
+  const resume = marksTrimmed
+    ? `${base}; the pending mark list keeps only its newest rows, so older marks stay pending and are not listed here`
+    : base;
   payload.continuation =
     `Status pages are bounded to ${cap} bytes; omitted ${omitted.join(", ")}; ${resume}.`;
   return payload;
@@ -1429,9 +1482,37 @@ export function peekFoldSource(input: {
   offset?: number;
   toolName?: string;
   projectEntry?: (entry: Record<string, unknown>) => unknown[];
+  briefOnly?: boolean;
 }): Record<string, unknown> {
   const fold = input.state.folds.find((item) => item.id === input.foldId);
   if (!fold) throw new Error(`Unknown active-context fold ${input.foldId}`);
+  // A BRIEF IS NOT A PEEK, AND IT MUST NOT COST ONE (2026-11-09). `peek` recovers every
+  // source message exactly, re-hashes it against its ref, and renders a bounded window of
+  // plain text: the right work when the caller wants HISTORY, and absurd work when the
+  // caller wants the one-line summary of a fold it has not been shown. That cost is why
+  // listings carried briefs to begin with. This branch reads nothing but state — no exact
+  // recovery, no digest, no descendant index — so a listing can stop narrating folds and
+  // point at a read that costs a handful of tokens instead of a 16KB window of source.
+  if (input.briefOnly) {
+    return {
+      version: 1,
+      action: "peek",
+      mode: "brief",
+      id: fold.id,
+      kind: fold.kind,
+      parentId: fold.parentId,
+      depth: foldDepth(input.state, fold),
+      brief: foldBrief(fold, input.state),
+      sourceCount: flattenFoldRefs(fold, input.state).length,
+      sourceChars: fold.sourceChars,
+      state: input.state.expanded.includes(fold.id) ? "expanded" : "folded",
+      children: childFoldIds(fold),
+      wider: {
+        peek: { action: "peek", id: fold.id },
+        expand: { action: "expand", id: fold.id },
+      },
+    };
+  }
   const storedMessages = foldStoredSpan({
     foldId: input.foldId,
     state: input.state,
