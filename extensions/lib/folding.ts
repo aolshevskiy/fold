@@ -1230,6 +1230,14 @@ export function activeContextStatus(
       status: { action: "status", offset, limit },
       reboundary: { action: "reboundary", ids: ["<source-or-fold-id>"] },
       brief: { action: "brief", id: "<pending-fold-id>", brief: `<factual brief, at most ${ACTIVE_CONTEXT_POLICY.maxBriefChars} characters>` },
+      // READING A BRIEF IS A DIFFERENT CALL FROM WRITING ONE, AND NO LISTING ROW CARRIES
+      // ONE ANY MORE (2026-11-09). A row is identity, kind, depth, state and interval; the
+      // folds listing therefore showed an agent 19 rows of intervals with no stated way to
+      // learn what any of them held, and the tree row was the only place the pointer
+      // existed. This is the surface that documents the whole tool, so the read belongs
+      // here rather than repeated on every row: it is O(1) bytes against a 24KB page bound,
+      // and gate 168 holds it to the schema like every other entry.
+      readBrief: { action: "peek", id: "<fold-id>", briefOnly: true },
       pin: { action: "pin", ids: ["<source-or-fold-id>"] },
     },
   };
