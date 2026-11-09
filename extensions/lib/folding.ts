@@ -1523,7 +1523,37 @@ export function peekFoldSource(input: {
   briefOnly?: boolean;
 }): Record<string, unknown> {
   const fold = input.state.folds.find((item) => item.id === input.foldId);
-  if (!fold) throw new Error(`Unknown active-context fold ${input.foldId}`);
+  // A PENDING MARK HAS A BRIEF AND NO HISTORY YET (2026-11-09). `brief` takes a pending id
+  // and `peek briefOnly` took only committed ones, so the mark page added the day before
+  // handed out ids to a reader that refused every one of them: 'Unknown active-context
+  // fold', on all twenty, on the first live call. A mark is not in `state.folds` because
+  // it has not been cut yet; it is in `state.pendingMarks`, and the brief it carries is
+  // exactly what an agent decides on before writing one of its own. This branch reads the
+  // same state and reports what is actually known — no parent, no depth, no interval,
+  // because there is no fold yet — rather than a shape borrowed from one that exists.
+  if (!fold) {
+    const mark = (input.state.pendingMarks ?? []).find((item) => item.id === input.foldId);
+    if (mark && input.briefOnly) {
+      const folded = mark.mark === "fold" ? mark : null;
+      return {
+        version: 1,
+        action: "peek",
+        mode: "brief",
+        id: mark.id,
+        kind: folded?.kind ?? null,
+        pending: true,
+        mark: mark.mark,
+        parentId: null,
+        depth: null,
+        brief: folded?.brief ?? null,
+        briefProvenance: folded?.briefProvenance ? { ...folded.briefProvenance } : null,
+        sourceCount: folded ? folded.parts.length : null,
+        state: "pending",
+        wider: { status: { action: "status", detail: "marks" } },
+      };
+    }
+    throw new Error(`Unknown active-context fold ${input.foldId}`);
+  }
   // A BRIEF IS NOT A PEEK, AND IT MUST NOT COST ONE (2026-11-09). `peek` recovers every
   // source message exactly, re-hashes it against its ref, and renders a bounded window of
   // plain text: the right work when the caller wants HISTORY, and absurd work when the

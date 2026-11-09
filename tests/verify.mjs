@@ -10930,6 +10930,36 @@ async function gateNoFoldWithoutABrief() {
   assert(walkedMarks.every((row) => typeof row.tokens === "number" && String(row.kind).length > 0),
     "A mark page row was an opaque id with nothing to decide by");
 
+  // THE PAGE HANDS OUT IDS, SO THE READ MUST ACCEPT THEM (2026-11-09, found by shipping it
+  // without). `brief` has always taken a pending id; `peek briefOnly` resolved only
+  // `state.folds` and threw 'Unknown active-context fold' on every pending mark, so the page
+  // that exists to make marks briefable pointed at a read that refused them — on all twenty,
+  // on its first live call. Every id the page lists must now read back, agreeing with the
+  // runtime about the brief an agent decides on before writing its own.
+  const liveById = new Map((await frontierCuts(runtime)).map((cut) => [cut.id, cut]));
+  for (const row of walkedMarks) {
+    const read = (await toolCall(runtime, { action: "peek", id: row.id, briefOnly: true })).details;
+    const live = liveById.get(row.id);
+    assert.equal(read.id, row.id, "The brief read answered about a different fold");
+    assert.equal(read.pending, true, "A pending mark was read as though it were already cut");
+    assert.equal(read.state, "pending");
+    assert.equal(read.kind, live.kind);
+    assert.equal(read.brief, live.brief,
+      "The brief read and the runtime disagree about a pending mark");
+    assert.equal(read.briefProvenance.kind, live.briefProvenance.kind);
+    assert.equal(read.sourceCount >= 1, true, "A pending mark reported no source at all");
+  }
+  // The error contract holds exactly where it should: an id nobody knows still throws, and
+  // a pending mark still cannot be peeked as SOURCE, because it has no history to recover.
+  await assert.rejects(
+    () => toolCall(runtime, { action: "peek", id: "fold_nobody_at_all", briefOnly: true }),
+    /Unknown active-context fold/,
+  );
+  await assert.rejects(
+    () => toolCall(runtime, { action: "peek", id: walkedMarks[0].id }),
+    /Unknown active-context fold/,
+  );
+
   // SUPPLIED: kept verbatim, and it REPLACES the deterministic fill rather than joining it.
   const supplied = "The second inspection is stale; its exact stdout and the failing path stay recoverable.";
   const kept = await briefCut(runtime, cuts[1], supplied);

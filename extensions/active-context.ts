@@ -4746,7 +4746,12 @@ export function registerActiveContext(pi: any, options: {
             } : { durable: "this result stays in your context like any other tool result" }),
           });
         }
-        throw new Error(`Unknown active-context fold ${id}`);
+        // A BRIEF-ONLY READ NEEDS NO FOLD, AND NO HISTORY (2026-11-09). `brief` has always
+        // taken a pending id, so a mark carries a brief an agent decides on before writing
+        // its own; refusing here made the mark page a list of ids nothing could read. This
+        // throw belongs to the SOURCE path, which needs a span to recover. `peekFoldSource`
+        // resolves marks out of state and answers with what is known about them.
+        if (params.briefOnly !== true) throw new Error(`Unknown active-context fold ${id}`);
       }
       // A BRIEF-ONLY READ ADMITS NO SOURCE, so it does not pass the fence that governs
       // source: `admit` exists to bound and account the bytes a read puts back into the
