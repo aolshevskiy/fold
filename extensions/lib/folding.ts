@@ -1198,6 +1198,12 @@ export function activeContextStatus(
           folds: { action: "status", detail: "folds", offset: 0, limit: 40 },
           objects: { action: "status", detail: "objects", offset: 0, limit: 40 },
           tree: { action: "status", detail: "tree", offset: 0 },
+          // THE IDS TO BRIEF WITH HAVE A PAGE OF THEIR OWN (2026-11-09). The inline
+          // `pendingFolds` array is bounded like everything else, so a deep session saw
+          // 21 of 48 marks and the remaining 27 lost the only reference that makes them
+          // briefable: there was no page to reach them by, and `peek briefOnly` needs an
+          // id first. id/kind/tokens/briefed only, so a page holds 40 marks rather than 10.
+          marks: { action: "status", detail: "marks", offset: 0, limit: 40 },
         },
       }
       : {
@@ -1311,7 +1317,14 @@ export function boundStatusPayload(
   // agent needs an id from in order to brief — collapsed to nothing and the duplicate rode
   // on at full size. Nothing here may be kept at another's expense when it is a subset.
   const schedulingTrimmed = shrink(scheduling, "marks", "scheduling mark row(s)", true) > 0;
-  const pendingTrimmed = shrink(automatic, "pendingFolds", "pending fold row(s)", true) > 0;
+  // THE FLOOR IS 1, AND IT IS A FLOOR RATHER THAN A SIZE (2026-11-09). At zero the search
+  // may empty the list, and the id an agent needs in order to brief a mark is then
+  // reachable from nowhere. Measured: at the shipped 24,000-byte cap this costs nothing,
+  // because ten mark rows fit even against 256 marks carrying full 2,000-character
+  // briefs; the floor only binds below ~2,640 bytes, where one row is the whole page.
+  // Only the operational copy is floored. `scheduling.marks` is the accounting duplicate,
+  // and a subset kept at the original's expense is the inversion the order above forbids.
+  const pendingTrimmed = shrink(automatic, "pendingFolds", "pending fold row(s)", true, 1) > 0;
   const marksTrimmed = pendingTrimmed || schedulingTrimmed;
   if (shrink(payload, "sourceMap", "source map row(s)") > 0) payload.sourceMapTruncated = true;
   shrink(payload, "topFolds", "top fold row(s)");
@@ -1323,7 +1336,7 @@ export function boundStatusPayload(
   const receiptRowsDropped =
     shrink(lastEpoch, "applied", "applied receipt row(s)", true) +
     shrink(lastEpoch, "absorbed", "absorbed receipt row(s)", true) > 0;
-  const rowLabel = (key: string): string => key === "folds" ? "fold row(s)" : key === "objects" ? "object row(s)" : "tree row(s)";
+  const rowLabel = (key: string): string => key === "folds" ? "fold row(s)" : key === "objects" ? "object row(s)" : key === "marks" ? "mark row(s)" : "tree row(s)";
   let continueAt: number | null = null;
   if (detail === "folds" || detail === "objects") {
     const rideKey = detail === "folds" ? "objects" : "folds";
@@ -1333,10 +1346,13 @@ export function boundStatusPayload(
       else payload.nextObjectOffset = offset + rideKept;
     }
   }
-  const primaryKey = detail === "objects" ? "objects" : detail === "tree" ? "tree" : detail === "folds" ? "folds" : null;
+  const primaryKey = detail === "objects" ? "objects" : detail === "tree" ? "tree" : detail === "folds" ? "folds" : detail === "marks" ? "marks" : null;
   if (primaryKey && shrink(payload, primaryKey, rowLabel(primaryKey), false, 1) > 0) {
     continueAt = offset + (payload[primaryKey] as unknown[]).length;
+    // `nextOffset` is the FOLD listing's cursor. A mark page that wrote it would send the
+    // caller's next `detail: "folds"` call to a row number taken from a different list.
     if (primaryKey === "objects") payload.nextObjectOffset = continueAt;
+    else if (primaryKey === "marks") payload.nextMarkOffset = continueAt;
     else payload.nextOffset = continueAt;
   }
   if (!omitted.length) return payload;
@@ -1352,9 +1368,13 @@ export function boundStatusPayload(
     ? `${pageable}; the epoch receipt keeps only its newest rows and the trimmed rows have no page`
     : (continueAt === null ? "the full lists stay reachable through the paged status details" : pageable);
   // A trimmed mark is NOT lost and must not be described as if it were: it lives on the
-  // runtime and commits with the epoch. It says so plainly rather than pointing at a page.
-  const resume = marksTrimmed
-    ? `${base}; the pending mark list keeps only its newest rows, so older marks stay pending and are not listed here`
+  // runtime and commits with the epoch. The sentence now also names the page, because until
+  // `detail: "marks"` existed it sent the agent to "the paged status details" and no such
+  // page listed marks; the only route through was to page `objects` past its end and find
+  // them riding along. On the mark page itself the clause is wrong to add: that IS the list
+  // being trimmed.
+  const resume = marksTrimmed && detail !== "marks"
+    ? `${base}; the pending mark list keeps only its newest rows, so older marks stay pending and are not listed here; { action: "status", detail: "marks" } lists all of them`
     : base;
   payload.continuation =
     `Status pages are bounded to ${cap} bytes; omitted ${omitted.join(", ")}; ${resume}.`;

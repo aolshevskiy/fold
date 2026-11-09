@@ -4526,7 +4526,7 @@ export function registerActiveContext(pi: any, options: {
     const snapshot = authoritativeSnapshotFor(ctx);
     if (action === "status") {
       const detail = ownValue(params, "detail");
-      const details = ["fold_candidates", "tree", "folds", "objects", "diagnostics"];
+      const details = ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"];
       if (detail !== undefined && !details.includes(String(detail))) {
         throw new Error(`status detail must be one of ${details.map((name) => `'${name}'`).join(", ")}`);
       }
@@ -4541,7 +4541,26 @@ export function registerActiveContext(pi: any, options: {
       // question asked deliberately, so they now answer it on a deliberate page. The
       // summary counts stay inline: knowing the ledger is running is not expensive.
       const diagnosticsPage = detail === "diagnostics";
+      const marksPage = detail === "marks";
       const accounting = markAccounting(snapshot, persistence.state);
+      // THE IDS TO BRIEF WITH, ON A PAGE THAT CAN HOLD ALL OF THEM (2026-11-09). The inline
+      // list below is bounded by the byte cap like everything else, so a deep session saw
+      // 21 of 48 marks; the other 27 lost the only reference that makes them briefable, and
+      // `peek briefOnly` needs an id before it can help. This page carries id, kind, tokens
+      // and `briefed` and nothing else, so forty marks cost what ten briefs cost.
+      const pendingRows = pendingMarks(persistence.state).map((mark) => ({
+        id: mark.id,
+        kind: mark.kind,
+        tokens: estimatedTokens(markFreedBytes(snapshot, persistence.state!, mark)),
+        briefed: mark.briefProvenance?.kind === "supplied" ||
+          mark.briefProvenance?.kind === "augmented",
+        brief: mark.brief ?? null,
+        briefProvenance: mark.briefProvenance ? clone(mark.briefProvenance) : null,
+      }));
+      const markRows = pendingRows.map((row) => ({
+        id: row.id, kind: row.kind, tokens: row.tokens, briefed: row.briefed,
+      }));
+      const markPageRows = markRows.slice(statusOffset, statusOffset + statusLimit);
       return toolPayload(boundStatusPayload({
         ...activeContextStatus(
           snapshot,
@@ -4634,15 +4653,7 @@ export function registerActiveContext(pi: any, options: {
           // from the LIVE state rather than the durable record: a frontier cut is derived
           // from its span and is not written on its own, so the durable record is behind
           // by design and only a brief or a commit brings it forward.
-          pendingFolds: pendingMarks(persistence.state).map((mark) => ({
-            id: mark.id,
-            kind: mark.kind,
-            tokens: estimatedTokens(markFreedBytes(snapshot, persistence.state!, mark)),
-            briefed: mark.briefProvenance?.kind === "supplied" ||
-              mark.briefProvenance?.kind === "augmented",
-            brief: mark.brief ?? null,
-            briefProvenance: mark.briefProvenance ? clone(mark.briefProvenance) : null,
-          })),
+          ...(marksPage ? {} : { pendingFolds: pendingRows }),
           nativeSummaries: "disabled",
           instrumentation: {
             enabled: true,
@@ -4671,6 +4682,13 @@ export function registerActiveContext(pi: any, options: {
           }),
         } : {}),
         ...(detail === "tree" ? { tree: foldTreeDetail(snapshot, persistence.state).slice(statusOffset) } : {}),
+        ...(marksPage ? {
+          marks: markPageRows,
+          totalMarks: markRows.length,
+          nextMarkOffset: statusOffset + markPageRows.length < markRows.length
+            ? statusOffset + markPageRows.length
+            : null,
+        } : {}),
       }, typeof detail === "string" ? detail : null, statusOffset));
     }
     if (action === "peek") {
@@ -5446,7 +5464,7 @@ export function registerActiveContext(pi: any, options: {
     allowedActions: allowedToolActions,
     fullSurface: true,
     maxBriefChars: ACTIVE_CONTEXT_POLICY.agentBriefReserve,
-    statusDetails: ["fold_candidates", "tree", "folds", "objects", "diagnostics"],
+    statusDetails: ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"],
     minPeekSliceBytes: PEEK_MIN_SLICE_BYTES,
     defaultPeekBytes: PEEK_DEFAULT_MAX_BYTES,
     handler: toolHandler,

@@ -3723,7 +3723,7 @@ async function gateStatusIndexDiet() {
 
   // The full tree stays reachable, explicitly and paged, and never auto-injected.
   const schema = [...lean.tools.values()][0].parameters.properties.detail.enum;
-  assert.deepEqual([...schema], ["fold_candidates", "tree", "folds", "objects", "diagnostics"]);
+  assert.deepEqual([...schema], ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"]);
   assert(pagedFolds.folds.length >= 1);
   assert.equal(pagedFolds.index, undefined);
   assert.deepEqual(
@@ -3849,11 +3849,11 @@ async function gateStatusIndexDiet() {
   // The paged details are part of the surface, and an unknown one still names the set.
   assert.deepEqual(
     [...[...lean.tools.values()][0].parameters.properties.detail.enum],
-    ["fold_candidates", "tree", "folds", "objects", "diagnostics"],
+    ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"],
   );
   await assert.rejects(
     () => toolCall(lean, { action: "status", detail: "everything" }),
-    /status detail must be one of 'fold_candidates', 'tree', 'folds', 'objects', 'diagnostics'/,
+    /status detail must be one of 'fold_candidates', 'tree', 'folds', 'objects', 'marks', 'diagnostics'/,
   );
 
   return {
@@ -7156,7 +7156,7 @@ async function gateStatusPagesAreBounded() {
   // defect the move removes. Presence is asserted exactly where truncation is forced: the
   // listing walks below, and the small-session block below that states the converse.
   const measured = {};
-  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "diagnostics"]) {
+  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"]) {
     const result = await toolStatus(runtime, "pi_fold_context", detail);
     const delivered = Buffer.byteLength(result.content[0].text, "utf8");
     assert(delivered <= context.CONTEXT_STATUS_RESPONSE_BYTES,
@@ -7224,7 +7224,7 @@ async function gateStatusPagesAreBounded() {
   // whole and unmarked.
   const small = makeRuntime(makeFixture({ turns: 2, resultChars: 400, contextWindow: 100_000 }));
   await startRuntime(small);
-  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "diagnostics"]) {
+  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"]) {
     const result = await toolStatus(small, "pi_fold_context", detail);
     assert(Buffer.byteLength(result.content[0].text, "utf8") <= context.CONTEXT_STATUS_RESPONSE_BYTES);
     assert.equal(result.details.continuation, undefined,
@@ -7235,6 +7235,24 @@ async function gateStatusPagesAreBounded() {
   const diet = (await toolStatus(runtime)).details;
   assert.equal(diet.paging.note, "Results are delivered in bounded pages.");
   assert.equal(/—/.test(JSON.stringify(diet)), false, "An em dash reached the status surface");
+
+  // THE MARK PAGE (2026-11-09). The inline pending list is bounded by the byte cap like
+  // everything else, so a deep session loses ids that `brief` and `peek briefOnly` both
+  // need before they can do anything. This page is where they live instead: id, kind,
+  // tokens and `briefed`, with a cursor of its own so it cannot be mistaken for folds.
+  assert.deepEqual(diet.paging.marks, { action: "status", detail: "marks", offset: 0, limit: 40 },
+    "The diet paging block does not advertise the mark page");
+  const markShape = (await toolStatus(runtime, "pi_fold_context", "marks")).details;
+  assert(Array.isArray(markShape.marks), "The mark page carried no mark list");
+  assert.equal(markShape.marks.length, Math.min(40, markShape.totalMarks),
+    "The mark page did not deliver the rows its own total describes");
+  assert(markShape.marks.every((row) => row.brief === undefined),
+    "A mark page row carried a brief, which is the mass this page exists to avoid");
+  assert.equal(markShape.nextMarkOffset, null,
+    "An untruncated mark page named a next offset");
+  assert.equal(markShape.folds, undefined, "The mark page carried a fold listing as well");
+  assert.equal(markShape.continuation, undefined,
+    "An untruncated mark page carried a continuation marker");
 
   // WHAT KEEPS ITS BRIEF (2026-11-09). Listings stopped narrating; three surfaces did not,
   // and each for a stated reason. A change that quietly stripped these too would look like
@@ -7305,6 +7323,25 @@ async function gateStatusPagesAreBounded() {
     `The continuation did not account for the trimmed marks: ${markPayload.continuation}`);
   assert(markPayload.continuation.includes("older marks stay pending"),
     "The continuation implied trimmed marks were gone rather than still pending");
+
+  // THE FLOOR IS A FLOOR, NOT A FIT (2026-11-09). Measured at the shipped cap this costs
+  // nothing — ten rows fit even here — but at a cap that cannot pay for one row the search
+  // used to empty the list, and the id needed to brief a mark was then reachable from
+  // nowhere. Pinned at 2,000 bytes, below a single row's own cost: one row must survive,
+  // it must be the newest, and the page must still account for what it dropped.
+  const floored = context.boundStatusPayload({
+    version: 1,
+    automatic: {
+      pendingFolds: markBulks.map((mark) => ({ ...mark })),
+      scheduling: { marks: [] },
+    },
+  }, null, 0, 2_000);
+  assert.equal(floored.automatic.pendingFolds.length, 1,
+    "The mark floor did not hold one row at a cap that cannot pay for it");
+  assert.equal(floored.automatic.pendingFolds[0].id, markBulks.at(-1).id,
+    "The floored row was not the newest mark");
+  assert(/pending fold row\(s\)/.test(floored.continuation),
+    "The floored page did not account for the rows it dropped to hold one");
 
   return {
     cap: context.CONTEXT_STATUS_RESPONSE_BYTES,
@@ -10863,6 +10900,35 @@ async function gateNoFoldWithoutABrief() {
     const cut = cutById.get(mark.id);
     return !cut || mark.brief === cut.brief;
   }), "The page and the runtime disagree about a pending mark's brief");
+
+  // THE MARK PAGE REACHES EVERY ID THE INLINE LIST CANNOT HOLD (2026-11-09). `pendingFolds`
+  // is bounded by bytes, so on a deep session it lists some of the marks and the rest lose
+  // the only reference that makes them briefable — `peek briefOnly` needs an id first. The
+  // page is bounded by `limit` alone, so paging it must recover exactly the live mark set.
+  const callMarks = async (offset, limit) => runtime.tools.get("pi_fold_context").execute(
+    `marks-${offset}`,
+    { action: "status", detail: "marks", offset, limit },
+    new AbortController().signal,
+    undefined,
+    runtime.ctx,
+  );
+  const walkedMarks = [];
+  for (let offset = 0, guard = 0; guard < 20; guard += 1) {
+    const page = (await callMarks(offset, 2)).details;
+    walkedMarks.push(...page.marks);
+    if (page.nextMarkOffset === null) break;
+    assert(page.nextMarkOffset > offset, "The mark page cursor did not advance");
+    offset = page.nextMarkOffset;
+  }
+  const liveMarkIds = (await frontierCuts(runtime)).map((cut) => cut.id).sort();
+  assert.deepEqual([...walkedMarks.map((row) => row.id)].sort(), liveMarkIds,
+    "The mark page did not enumerate every pending mark");
+  assert.equal(new Set(walkedMarks.map((row) => row.id)).size, walkedMarks.length,
+    "The mark page repeated a row while paging");
+  assert(walkedMarks.every((row) => row.brief === undefined),
+    "A mark page row carried a brief");
+  assert(walkedMarks.every((row) => typeof row.tokens === "number" && String(row.kind).length > 0),
+    "A mark page row was an opaque id with nothing to decide by");
 
   // SUPPLIED: kept verbatim, and it REPLACES the deterministic fill rather than joining it.
   const supplied = "The second inspection is stale; its exact stdout and the failing path stay recoverable.";
