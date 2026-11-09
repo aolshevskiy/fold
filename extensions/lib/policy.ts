@@ -283,6 +283,25 @@ export function servingBudgetTokens(window: number): number {
 }
 
 export const MAX_PENDING_MARKS = 256;
+/**
+ * How many instrumentation entries each ledger array keeps in memory.
+ *
+ * These three arrays (`records`, `observations`, `events`) were the last thing the status
+ * payload serialized without a bound. They scale with session LENGTH rather than fold
+ * count: `recordContextEvent` pushes on every context event, and one observed session went
+ * 106 → 153 inside an hour. The 2026-11-08 work hid them behind `detail: "diagnostics"`
+ * instead, which bounds what a page carries and not what the process retains.
+ *
+ * 256 is deliberately larger than a page — 256 events is roughly 50KB against a 24,000
+ * byte cap — because memory is what this bounds and page size stays `boundStatusPayload`'s
+ * job. Sizing it to the page would quietly redefine what the diagnostics page is for.
+ *
+ * Safe to drop the oldest because the array is a cache of a transcript that already
+ * exists: `emit()` appends every event to the durable stream, which is where the suite
+ * reads history from. Truncation must never move a total: `sequence`, `projections` and
+ * `countsByKind` are running counters and are never recomputed from a truncated array.
+ */
+export const MAX_LEDGER_ENTRIES = 256;
 export const ESTIMATED_BYTES_PER_TOKEN = 4;
 
 /**

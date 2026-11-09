@@ -1,5 +1,25 @@
 import { evidenceSha256, sha256Value } from "../json.ts";
 import { ownValue } from "./canonical.ts";
+import { MAX_LEDGER_ENTRIES } from "./policy.ts";
+
+/**
+ * Keep the newest entries, drop the rest.
+ *
+ * THE LEDGER WAS THE LAST UNBOUNDED ARRAY IN THE STATUS PAYLOAD (2026-11-09). Its three
+ * arrays grow with session length rather than fold count, and nothing ever pruned them,
+ * so a long session both retained and cloned every event it had ever recorded. Dropping
+ * the oldest is free of consequence: `emit()` writes each event to the durable stream
+ * before it reaches the ledger, so the array is a tail cache of a transcript, not the
+ * record. Nothing reads an entry here that is not also on disk.
+ *
+ * Callers must keep their TOTALS monotonic. `sequence`, `projections` and `countsByKind`
+ * are running counters, never recomputed from this list, so a truncation changes what a
+ * reader can inspect and never what it is told happened.
+ */
+function retainNewest<T>(list: T[], entry: T): void {
+  list.push(entry);
+  if (list.length > MAX_LEDGER_ENTRIES) list.shift();
+}
 
 export type ProjectionChange = "identical" | "append" | "rewrite";
 
@@ -166,7 +186,7 @@ export function recordContextEvent(
     ...payload,
   };
   ledger.countsByKind[kind] = (ledger.countsByKind[kind] ?? 0) + 1;
-  ledger.events.push(record);
+  retainNewest(ledger.events, record);
   return record;
 }
 
@@ -179,7 +199,7 @@ export function recordProjection(
   if (comparison.change === "rewrite") ledger.rewrites += 1;
   else if (comparison.change === "append") ledger.appends += 1;
   else ledger.identical += 1;
-  ledger.records.push({
+  retainNewest(ledger.records, {
     ...comparison,
     ordinal: ledger.projections,
     prefixSha256: sha256Value(digests.slice(0, comparison.previousCount || digests.length)),
@@ -218,7 +238,7 @@ export function observeCacheUsage(
   };
   if (missed) ledger.observedMisses += 1;
   if (observation.providerSideMiss) ledger.providerSideMisses += 1;
-  ledger.observations.push(observation);
+  retainNewest(ledger.observations, observation);
   return observation;
 }
 
@@ -232,5 +252,15 @@ export function ledgerSummary(ledger: InstrumentationLedger): Record<string, unk
     providerSideCacheMisses: ledger.providerSideMisses,
     contextEvents: ledger.sequence,
     contextEventsByKind: { ...ledger.countsByKind },
+    // A TRUNCATED ARRAY AND A SHORT ONE LOOK IDENTICAL WITHOUT THIS (2026-11-09). The
+    // arrays above are totals and the arrays on the diagnostics page are only the newest
+    // MAX_LEDGER_ENTRIES, so a reader comparing events.length to contextEvents would read
+    // the ring as a bug. Retained is what is inspectable; the counters above are what
+    // happened.
+    retained: {
+      projectionRecords: ledger.records.length,
+      cacheObservations: ledger.observations.length,
+      events: ledger.events.length,
+    },
   };
 }

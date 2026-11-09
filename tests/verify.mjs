@@ -3785,6 +3785,67 @@ async function gateStatusIndexDiet() {
   assert(diagnostic.automatic.pendingFolds.length === leanStatus.automatic.pendingFolds.length,
     "The diagnostics page disagrees with the lean page about the foldable marks");
 
+  // THE LEDGER IS BOUNDED AT THE SOURCE (2026-11-09). Its three arrays are ring buffers
+  // now, so the diagnostics page shows the newest MAX_LEDGER_ENTRIES and nothing anywhere
+  // shows the rest. That is only safe because the durable stream still holds every event,
+  // so both halves are asserted together: a ring with no durable copy loses history, and a
+  // durable copy with an unbounded ring is what this replaced. The totals must not move
+  // either — a truncated array may shrink what a reader can inspect, never what it is
+  // told happened.
+  const ringCap = policyModule.MAX_LEDGER_ENTRIES;
+  const ringOverflow = ringCap + 44;
+  const ledgerRing = context.emptyLedger();
+  const ringEnvelope = { session_id: "ring-fixture", ordinal: 0, revision: 0, at: 0 };
+  for (let index = 0; index < ringOverflow; index += 1) {
+    context.recordContextEvent(ledgerRing, "context.fold", ringEnvelope, { index });
+    context.recordProjection(ledgerRing, {
+      change: "append", previousCount: 0, nextCount: 1, appendedCount: 1, firstDivergentIndex: null,
+    }, []);
+    context.observeCacheUsage(ledgerRing, { change: "append", usage: { input: 100, cacheRead: 100, cacheWrite: 0 } });
+  }
+  const ringSummary = context.ledgerSummary(ledgerRing);
+  assert.equal(ledgerRing.events.length, ringCap, "the event ring kept more than its cap");
+  assert.equal(ledgerRing.records.length, ringCap, "the projection ring kept more than its cap");
+  assert.equal(ledgerRing.observations.length, ringCap, "the cache observation ring kept more than its cap");
+  assert.deepEqual(ringSummary.retained, {
+    projectionRecords: ringCap, cacheObservations: ringCap, events: ringCap,
+  }, "the summary does not report what the rings retained");
+  assert.equal(ringSummary.contextEvents, ringOverflow, "truncating the event ring moved the total");
+  assert.equal(ringSummary.projections, ringOverflow, "truncating the projection ring moved the total");
+  assert.deepEqual(ringSummary.contextEventsByKind, { "context.fold": ringOverflow },
+    "truncating the event ring moved the per-kind counts");
+  assert.equal(ledgerRing.events.at(-1).seq, ringOverflow, "the event ring dropped the newest record");
+  assert.equal(ledgerRing.events[0].seq, ringOverflow - ringCap + 1,
+    "the event ring kept a record older than the cap allows");
+  assert.equal(ringSummary.observedCacheMisses, 0,
+    "filling a warm cache three hundred times registered a miss");
+
+  // The ring is only honest if the discarded half is still on disk. The live runtime's
+  // durable stream is where the suite reads history from, so it is also the witness that
+  // the ledger may drop the oldest entry without dropping the event.
+  //
+  // The stream and the ledger total are NOT asserted equal, deliberately: a ledger reset
+  // re-bases the total to zero while the stream keeps every entry, so on this fixture the
+  // stream holds exactly one more than the ledger counted. Equality would pin the accident.
+  // What must hold is that the stream never holds fewer events than the ledger counted, and
+  // that a ring which has not yet filled has dropped nothing.
+  await settle();
+  const durableStatus = (await toolStatus(lean, "pi_fold_context")).details;
+  const durableInstrumentation = durableStatus.automatic.instrumentation;
+  const durableEvents = contextEvents(lean).length;
+  assert(durableEvents >= durableInstrumentation.contextEvents,
+    `the durable stream (${durableEvents}) holds fewer events than the ledger counted ` +
+    `(${durableInstrumentation.contextEvents}), so a dropped entry is a lost entry`);
+  assert.equal(durableInstrumentation.retained.events, Math.min(durableInstrumentation.contextEvents, ringCap),
+    "the event ring dropped entries before it was full");
+  // The page trims the retained tail as well — retained counts what the RING kept, the
+  // array is what survived the byte bound — so the claim is containment, not equality.
+  assert(diagnostic.automatic.instrumentation.events.length <=
+      diagnostic.automatic.instrumentation.retained.events,
+    "the diagnostics page delivered more events than the ring retained");
+  assert(diagnostic.automatic.instrumentation.events.length > 0,
+    "the diagnostics page delivered no events at all from a non-empty ring");
+
   // The paged details are part of the surface, and an unknown one still names the set.
   assert.deepEqual(
     [...[...lean.tools.values()][0].parameters.properties.detail.enum],

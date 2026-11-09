@@ -1295,6 +1295,16 @@ export function boundStatusPayload(
   // marks closest to the commit are the ones worth briefing; the older ones stay pending
   // on the runtime and simply do not appear here, which the continuation states.
   //
+  // WHAT IS LEFT HERE IS PRECEDENCE, NOT CORRECTNESS (2026-11-09, later the same day).
+  // Unbounded growth is now fixed at the source: the instrumentation arrays below are
+  // ring buffers keeping the newest MAX_LEDGER_ENTRIES, so no array in this payload can
+  // grow without a limit any more. These three `shrink` calls stay anyway, because a
+  // BOUNDED ledger still exceeds the cap — 256 events is roughly 50KB against a page of
+  // 24,000 — so the page must still choose what survives. A ledger row has no page of its
+  // own and nothing an agent acts on, while a listing row the caller explicitly paged for
+  // has both, so the ledger gives way first. Bounding it did not make the diagnostics page
+  // fit; that page trims its arrays on every deep session and is meant to.
+  //
   // THE ORDER IS THE LAW, and it is the opposite of what reads naturally. `scheduling.marks`
   // is the ACCOUNTING copy of the same marks, so it gives up its rows FIRST; trimming
   // `pendingFolds` first would let the page "fit" while the operational copy — the one an
