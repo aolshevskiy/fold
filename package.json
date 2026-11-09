@@ -51,7 +51,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/index.js"
     ]
   }
 }

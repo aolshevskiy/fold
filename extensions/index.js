@@ -1,5 +1,6 @@
 import { registerActiveContext } from "./active-context.ts";
 import { registerEvidenceIngestion } from "./evidence.js";
+import { loadFoldSettingsFile, registerFoldSettings } from "./settings.ts";
 
 export {
   applyFoldSettingsEdit,
@@ -78,6 +79,38 @@ export function registerPiFold(pi, options = {}) {
   return registerActiveContext(pi, options);
 }
 
+// THE ENTRY POINT READS ITS OWN SETTINGS (2026-11-09).
+//
+// `loadFoldSettingsFile` was written for the deployment to call at module scope and hand in,
+// and the shape that forced was a wrapper file living outside the package: register the
+// settings command, read the file, register the runtime with the result. A package whose own
+// entry point cannot read its own settings file needs a shim to be usable, which is a bug in
+// the package and not a fact about the deployment. So the default export reads the file
+// itself; callers that pass `options` still win, and `registerPiFold` keeps the behaviour it
+// always had for a host that composes the pieces by hand.
+//
+// The widget clear is a display preference, not part of the wiring: the bar is installed
+// unconditionally and latches `foldBar.installed`, so clearing the key on the events that can
+// precede or follow the install leaves the UI quiet without withdrawing the text fallback.
+// Folding, the tool, the pre-commit notice and the commands are untouched by it.
+const FOLD_BAR_KEY = "pi-fold-active-context";
+
 export default function piFold(pi, options) {
-  return registerPiFold(pi, options);
+  const settings = options ?? loadFoldSettingsFile();
+  registerFoldSettings(pi);
+  const runtime = registerPiFold(pi, settings);
+
+  const clearFoldBar = (_event, ctx) => {
+    if (ctx?.mode !== "tui") return;
+    try {
+      ctx.ui?.setWidget?.(FOLD_BAR_KEY, undefined);
+    } catch {
+      /* a host without widgets keeps whatever it has */
+    }
+  };
+  pi.on("session_start", clearFoldBar);
+  pi.on("turn_start", clearFoldBar);
+  pi.on("agent_settled", clearFoldBar);
+
+  return runtime;
 }
