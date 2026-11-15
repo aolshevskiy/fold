@@ -696,7 +696,7 @@ async function pagedStatusRows(runtime, detail, toolName = "pi_fold_context") {
       if (named) next = JSON.parse(named[1]).offset;
     }
     if (next === null && detail !== "tree") {
-      next = detail === "objects" ? payload.nextObjectOffset : payload.nextOffset;
+      next = payload.nextOffset;
     }
     if (typeof next !== "number" || next <= offset) break;
     offset = next;
@@ -1411,7 +1411,10 @@ async function gateLegacyLunaRegression() {
   // agent has no create verb to reach for.
   const cuts = await frontierCuts(runtime);
   assert(cuts.length >= 1, "Legacy fixture lacked a second tool fold for round-trip persistence");
-  assert.equal(cuts[0].briefProvenance.kind, "deterministic");
+  assert.equal(cuts[0].agentBrief, false,
+    "A legacy frontier cut reported an agent brief that no build could have written");
+  const legacyCutBrief = await markBrief(runtime, cuts[0].id);
+  assert(legacyCutBrief.trim().length > 0, "The legacy frontier cut arrived with no brief at all");
   assert.equal(runtime.notifications.filter((notice) => /Conflicting durable/.test(notice.message)).length, 0);
   const durableLegacy = runtime.branch.find((entry) => entry.id === "legacy-luna-record");
   assert.equal(json.stableStringify(durableLegacy.data), originalRecordBytes);
@@ -1421,7 +1424,7 @@ async function gateLegacyLunaRegression() {
   assert.equal(materialized(runtime).folds.find((fold) => fold.id === legacyFold.id).provenance.kind, "luna");
   return {
     durableKind: "luna",
-    payloadKind: cuts[0].briefProvenance.kind,
+    payloadKind: cuts[0].agentBrief ? "agent" : "deterministic",
     slateGenerator: "projection-model",
     conflictingErrors: 0,
     durableRecordBytesUnchanged: true,
@@ -1449,21 +1452,22 @@ async function gatePoisonedFloorRegression() {
   const cuts = await frontierCuts(runtime);
   const marked = cuts.find((mark) => mark.kind === "chapter");
   assert(marked, "Chapter-only fixture produced no chapter cut");
-  assert.equal(marked.briefProvenance.kind, "deterministic");
-  assert(marked.brief.length > 20 &&
-    marked.brief.length <= context.ACTIVE_CONTEXT_POLICY.maxBriefChars);
-  assert(!/pi_fold_context/i.test(marked.brief), "The deterministic brief leaked the tool name");
+  assert.equal(marked.agentBrief, false, "A deterministic fill was reported as an agent brief");
+  const markedBrief = await markBrief(runtime, marked.id);
+  assert(markedBrief.length > 20 &&
+    markedBrief.length <= context.ACTIVE_CONTEXT_POLICY.maxBriefChars);
+  assert(!/pi_fold_context/i.test(markedBrief), "The deterministic brief leaked the tool name");
   const committed = await measureAndCommit(runtime, 86_000, 100_000, "poisoned-floor-commit");
   const folded = committed.folds.find((fold) => fold.id === marked.id);
   assert(folded, "The floor-checked mark never became a fold");
   assert.equal(folded.kind, "chapter");
-  assert.equal(folded.brief, marked.brief);
+  assert.equal(folded.brief, markedBrief);
   assert.equal(folded.provenance.kind, "deterministic");
   return {
     marked: true,
     committed: true,
-    provenance: marked.briefProvenance.kind,
-    brief: marked.brief,
+    provenance: "deterministic",
+    brief: markedBrief,
   };
 }
 
@@ -2822,6 +2826,14 @@ async function frontierCuts(runtime) {
   // span and writes no persistence boundary of its own, so `materialized()` does not see
   // one until a brief or a commit carries it forward, which is the design and not a gap.
   return (await toolStatus(runtime)).details.automatic.pendingFolds ?? [];
+}
+
+/** A mark row carries a bounded head, not the whole brief (2026-11-16). The brief itself is one
+ *  free read away, which is what the row's span and head exist to point at. */
+async function markBrief(runtime, id) {
+  const result = await toolCall(runtime, { action: "peek", id, briefOnly: true });
+  assert(!result.isError, `peek on pending mark ${id} was refused: ${JSON.stringify(result)}`);
+  return String(result.details?.brief ?? "");
 }
 
 /** The agent's whole remaining hand on a pending fold: one sentence, written for free. */
@@ -7963,9 +7975,14 @@ async function gateProtectIsDurablePin() {
   const description = [...runtime.tools.values()][0].description;
   // The surface has to name BOTH halves, because a pin an agent cannot find the release
   // for is a leak: pinned mass counts against the cap gate 92 pins, and the agent is the
-  // only thing that can give it back.
-  assert(/\bPin with ids holds\b/.test(description), "The pin is not advertised in the tool surface");
-  assert(/\bunpin releases\b/.test(description), "The surface names the pin without naming its release");
+  // only thing that can give it back. It also has to state the cost, which is the clause a
+  // free-bookmark reading misses — pinning holds a span without paying for it, so the
+  // commit arrives later than it otherwise would.
+  assert(/\bholds it against automatic folding, consolidation and refolding\b/.test(description),
+    "The pin row does not state what it protects the span against");
+  assert(/\bunpin releases it\b/.test(description), "The surface names the pin without naming its release");
+  assert(/\bPinning frees nothing toward the commit\b/.test(description),
+    "The pin row does not state that pinning delays the commit rather than paying for it");
 
   // ONE crossing. Each one runs consolidation to a fixpoint, so three of them take a
   // thirty-turn session down to a single root and there is no second fold to leave
@@ -10887,28 +10904,36 @@ async function gateNoFoldWithoutABrief() {
   const cuts = await frontierCuts(runtime);
   assert(cuts.length >= 3, "The frontier cut too little to measure briefs against");
   for (const cut of cuts) {
-    assert(typeof cut.brief === "string" && cut.brief.trim(),
+    const brief = await markBrief(runtime, cut.id);
+    assert(typeof brief === "string" && brief.trim(),
       `Frontier cut ${cut.id} was made with no brief at all`);
-    assert.equal(cut.briefProvenance.kind, "deterministic",
+    assert(typeof cut.head === "string" && cut.head.length > 0,
+      `Frontier cut ${cut.id} carries no head for its row to show`);
+    assert.equal(cut.agentBrief, false,
       "A deterministic fill was recorded as though the agent had written it");
-    assert.equal(cut.agentBrief, false);
   }
 
-  // THE MARK LIST KEEPS ITS BRIEFS (2026-11-09). Listings stopped carrying briefs because
-  // a visible fold's brief is already in the window; a PENDING mark is not in the window at
-  // all, so its brief is the only thing that tells an agent what it is about to commit. It
-  // is bounded by the mark list's trim, never stripped.
+  // THE MARK LIST KEEPS A HEAD (2026-11-09, reshaped 2026-11-16). Listings stopped carrying
+  // briefs because a visible fold's brief is already in the window; a PENDING mark is not in the
+  // window at all, so something of its brief has to tell an agent what it is about to commit. A
+  // row now carries a bounded head plus its span, and the full text is one free `peek` away.
   const markPage = (await toolStatus(runtime, "pi_fold_context", "diagnostics")).details;
   assert(markPage.automatic.pendingFolds.length >= 1,
     "The fixture cut marks but the page listed none");
-  assert(markPage.automatic.pendingFolds.every((mark) =>
-    typeof mark.brief === "string" && mark.brief.length >= 1),
-  "A pending mark reached the page without the brief an agent briefs it with");
   const cutById = new Map(cuts.map((cut) => [cut.id, cut]));
-  assert(markPage.automatic.pendingFolds.every((mark) => {
+  for (const mark of markPage.automatic.pendingFolds) {
+    assert(typeof mark.head === "string" && mark.head.length >= 1,
+      "A pending mark reached the page without the head an agent recognises it by");
+    assert(typeof mark.startId === "string" && typeof mark.endId === "string",
+      `Pending mark ${mark.id} reached the page without its span`);
+    const full = await markBrief(runtime, mark.id);
+    const flatten = (value) => value.replace(/\s+/g, " ").trim();
+    assert(flatten(full).startsWith(flatten(mark.head).slice(0, 20)),
+      `The page head for ${mark.id} does not come from its own brief`);
     const cut = cutById.get(mark.id);
-    return !cut || mark.brief === cut.brief;
-  }), "The page and the runtime disagree about a pending mark's brief");
+    assert(!cut || cut.head === mark.head,
+      "The page and the runtime disagree about a pending mark's head");
+  }
 
   // THE MARK PAGE REACHES EVERY ID THE INLINE LIST CANNOT HOLD (2026-11-09). `pendingFolds`
   // is bounded by bytes, so on a deep session it lists some of the marks and the rest lose
@@ -10945,17 +10970,23 @@ async function gateNoFoldWithoutABrief() {
   // that exists to make marks briefable pointed at a read that refused them — on all twenty,
   // on its first live call. Every id the page lists must now read back, agreeing with the
   // runtime about the brief an agent decides on before writing its own.
-  const liveById = new Map((await frontierCuts(runtime)).map((cut) => [cut.id, cut]));
+  // THE PAGE AND THE READ AGREE ABOUT THE SAME MARK (2026-11-09, reshaped 2026-11-16). The row
+  // carries a bounded head rather than the whole brief, so agreement is now "the brief this id
+  // reads back starts with the head the page showed" — the durable state is the wrong witness
+  // here anyway, because a frontier cut writes no persistence boundary until a brief or a commit
+  // carries it forward.
+  const flattenBrief = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
   for (const row of walkedMarks) {
     const read = (await toolCall(runtime, { action: "peek", id: row.id, briefOnly: true })).details;
-    const live = liveById.get(row.id);
+    assert(read, `The page listed ${row.id} but the read returned no payload`);
     assert.equal(read.id, row.id, "The brief read answered about a different fold");
     assert.equal(read.pending, true, "A pending mark was read as though it were already cut");
     assert.equal(read.state, "pending");
-    assert.equal(read.kind, live.kind);
-    assert.equal(read.brief, live.brief,
-      "The brief read and the runtime disagree about a pending mark");
-    assert.equal(read.briefProvenance.kind, live.briefProvenance.kind);
+    assert.equal(read.kind, row.kind);
+    if (typeof row.head === "string" && row.head.length) {
+      assert(flattenBrief(read.brief).startsWith(flattenBrief(row.head).slice(0, 20)),
+        "The brief read and the runtime disagree about a pending mark");
+    }
     assert.equal(read.sourceCount >= 1, true, "A pending mark reported no source at all");
   }
   // The error contract holds exactly where it should: an id nobody knows still throws, and
@@ -10989,8 +11020,10 @@ async function gateNoFoldWithoutABrief() {
   assert.equal(kept.details.brief, supplied);
   const keptMark = (await frontierCuts(runtime)).find((fold) => fold.id === cuts[1].id);
   assert(keptMark, "The briefed cut left the pending set");
-  assert.equal(keptMark.brief, supplied, "A supplied brief was rewritten");
-  assert.equal(keptMark.briefProvenance.kind, "supplied", "A supplied brief lost its attribution");
+  // The row states attribution as a flag and shows a bounded head; the text itself is one free
+  // read away, which is the pair the surface promises.
+  assert.equal(keptMark.agentBrief, true, "A supplied brief lost its attribution");
+  assert.equal(await markBrief(runtime, cuts[1].id), supplied, "A supplied brief was rewritten");
 
   // A BAD SUPPLIED BRIEF IS REFUSED AS A MARK, ON THE PATH THAT SKIPS THE PREPARATION.
   //
@@ -13646,17 +13679,18 @@ async function gateFoldNoticeStatesTheApproach() {
   // What are they? Likely: ..." from memory, and a wrong guess writes an accurate-sounding
   // brief onto the wrong fold.
   for (const fold of cut) {
-    assert(typeof fold.brief === "string" && fold.brief.length > 0,
+    assert(typeof fold.head === "string" && fold.head.length > 0,
       `Pending fold ${fold.id} carries no deterministic brief for its row to show`);
-    assert(text.includes(`${fold.id} (`) && text.includes(fold.brief.slice(0, 40)),
-      `The notice row for ${fold.id} does not carry its own head: ${fold.brief.slice(0, 60)}`);
+    assert(text.includes(`${fold.id} (`) && text.includes(fold.head.slice(0, 40)),
+      `The notice row for ${fold.id} does not carry its own head: ${fold.head.slice(0, 60)}`);
   }
   const named = new Set(text.match(/fold_[0-9a-f]{16,}/g) ?? []);
   for (const id of named) {
     assert(cut.some((fold) => fold.id === id),
       `The notice named ${id}, which is not a staged fold`);
   }
-  assert(cut.some((fold) => fold.brief.length > 160) && /\.\.\./.test(text),
+  const longBriefs = await Promise.all(cut.map((fold) => markBrief(runtime, fold.id)));
+  assert(longBriefs.some((brief) => brief.length > 160) && /\.\.\./.test(text),
     "No bounded row stated its cut");
   const spoken = notices(await project(runtime));
   assert.equal(spoken[0].details.ephemeral, true, "The notice is not ephemeral");
@@ -20382,6 +20416,102 @@ async function gatePeekAnswersByState() {
   return { pendingRead: true, standingRead: true, aliasAgrees: true };
 }
 
+/**
+ * THE RIDE CARRIES THE ROW A BRIEF NEEDS (2026-11-16). Every page rode `pendingFolds` in a
+ * cheaper shape than the marks page did, so a reader that wanted to recognise a mark paid a
+ * page switch for a hundred bytes — and the full brief it carried was the mass the byte bound
+ * kept trimming. One shape now rides every page, and the ride is paged: its depth no longer
+ * depends on how much else the page happened to carry.
+ */
+async function gateRideCarriesTheRowShape() {
+  const runtime = await epochToolRuntime({ turns: 12, resultChars: 8_000, contextWindow: 100_000 });
+  await settle();
+  const cuts = await frontierCuts(runtime);
+  assert(cuts.length >= 2, "The fixture staged too little to measure the ride");
+  const ride = (await toolStatus(runtime)).details.automatic.pendingFolds;
+  assert(ride.length >= 1, "The ride listed no mark");
+  for (const row of ride) {
+    assert(typeof row.startId === "string" && typeof row.endId === "string",
+      `Ride row ${row.id} carried no span, so it cannot be recognised`);
+    assert(typeof row.head === "string" && row.head.length > 0,
+      `Ride row ${row.id} carried no head`);
+    assert.equal(row.brief, undefined, `Ride row ${row.id} carried the whole brief`);
+    assert.equal(typeof row.agentBrief, "boolean", `Ride row ${row.id} did not state attribution`);
+  }
+  const limited = (await toolCall(runtime, { action: "status", detail: "folds", limit: 2 })).details;
+  assert(limited.automatic.pendingFolds.length <= 2,
+    `The ride ignored the page limit and returned ${limited.automatic.pendingFolds.length} rows`);
+  assert.equal(limited.nextObjectOffset, undefined,
+    "The page still carries nextObjectOffset, the second name for one cursor");
+  return { ridden: ride.length, limited: limited.automatic.pendingFolds.length };
+}
+
+/**
+ * A RETIRED ID SAYS WHERE ITS BYTES WENT (2026-11-16). 52 of 66 peeks in thirty days refused
+ * `Unknown active-context fold`, and the refused tokens were fold ids whose fold had been
+ * absorbed by consolidation or dissolved by a re-cut. The record ledger still holds the retired
+ * fold, so the reply names its successors instead of refusing: a mapping read, no bytes, no
+ * fence — and a write answers from the same resolver, because an id that stops resolving is not
+ * a reason to make the caller guess whether the verb or the id was wrong.
+ */
+async function gateRetiredIdResolves() {
+  const runtime = await epochToolRuntime({ turns: 14, resultChars: 12_000, contextWindow: 100_000 });
+  await measure(runtime, 96_000);
+  await project(runtime);
+  await settle();
+  const standing = (await toolStatus(runtime, "pi_fold_context", "folds")).details.folds
+    .filter((row) => row.startId && row.endId && (row.sourceIds?.length ?? 0) >= 2)
+    .sort((a, b) => (b.tokens ?? 0) - (a.tokens ?? 0));
+  assert(standing.length > 0, "No standing fold carried a span to re-cut");
+  const retired = standing[0];
+  const reCut = await toolCall(runtime, {
+    action: "reboundary",
+    ids: [retired.startId, retired.sourceIds[1]],
+    brief: "The opening of that span, re-cut so a retired id has somewhere to point.",
+  });
+  assert(!reCut.isError,
+    `The re-cut was refused: ${JSON.stringify(reCut.content?.[0]?.text ?? reCut)}`);
+  const after = (await toolStatus(runtime, "pi_fold_context", "folds")).details;
+  assert(!after.folds.some((row) => row.id === retired.id),
+    "The re-cut left the absorbed fold standing, so nothing was retired");
+
+  const read = (await toolCall(runtime, { action: "peek", id: retired.id })).details;
+  assert(read, "Peeking a retired id returned no payload");
+  assert.equal(read.mode, "retired");
+  assert.equal(read.source, null,
+    "A retired id returned source bytes, which would charge the fence a mapping read does not");
+  assert((read.retired?.supersededBy?.length ?? 0) >= 1,
+    `A retired id named no successor: ${JSON.stringify(read.retired ?? null)}`);
+  assert.equal(read.retired.id, retired.id);
+  const successor = read.retired.supersededBy[0];
+  // THE SUCCESSOR IS A LIVE FOLD, read without bytes: this fixture sits at its fence on purpose,
+  // and a source read would measure the refusal rather than the resolution. A brief-only read
+  // proves the id the reply named is a standing fold of this session, not another stale handle.
+  const served = (await toolCall(runtime, { action: "peek", id: successor, briefOnly: true })).details;
+  assert(served && served.id === successor, "The successor a retired id named does not resolve");
+  assert.notEqual(served.mode, "retired",
+    "The successor a retired id named is itself retired, so the reply pointed nowhere");
+
+  const refusedBrief = await toolCall(runtime, {
+    action: "brief", id: retired.id, brief: "A brief for a span that no longer has a boundary of its own.",
+  });
+  assert.equal(refusedBrief.details?.retired?.id, retired.id,
+    "brief on a retired id did not name where the bytes went");
+  assert.equal(refusedBrief.details?.brief, null,
+    "brief on a retired id claimed to have written something");
+
+  const unknown = `fold_${"0".repeat(24)}`;
+  let message = null;
+  try {
+    await toolCall(runtime, { action: "peek", id: unknown });
+  } catch (error) {
+    message = String(error?.message ?? error);
+  }
+  assert(message !== null && /Unknown active-context fold/.test(message),
+    `An id nobody wrote down did not keep the old refusal: ${message}`);
+  return { successor, successors: read.retired.supersededBy.length };
+}
+
 const gates = [
   [1, "Registration, parse and deployment branding", gateRegistrationAndBranding],
   [2, "The durable record: lattice, chain and rollback", gateDurableRecord],
@@ -20554,6 +20684,8 @@ const gates = [
   [192, "A mark row is identifiable", gateMarkRowRecognisable],
   [193, "One brief contract for both writers", gateRecutBriefContract],
   [194, "Peek answers by state", gatePeekAnswersByState],
+  [195, "The ride carries the row a brief needs", gateRideCarriesTheRowShape],
+  [196, "A retired id says where its bytes went", gateRetiredIdResolves],
 ];
 
 const gateFilter = (process.env.GATES ?? "")

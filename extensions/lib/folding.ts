@@ -56,6 +56,7 @@ import {
   PEEK_HEAD_SHARE,
   STATUS_DIET_INDEX_ROWS,
 } from "./policy.ts";
+import type { FoldRecordEntry } from "./persistence.ts";
 import type {
   ActiveContextSnapshot,
   ActiveContextState,
@@ -1210,9 +1211,6 @@ export function activeContextStatus(
       : {
         folds: selected.map((fold) => foldStatusRow(fold, state, snapshot)),
         objects: selectedObjects,
-        nextObjectOffset: offset + selectedObjects.length < objects.length
-          ? offset + selectedObjects.length
-          : null,
       }),
     offset,
     nextOffset: offset + selected.length < ordered.length ? offset + selected.length : null,
@@ -1259,6 +1257,20 @@ export function boundStatusPayload(
   cap: number = CONTEXT_STATUS_RESPONSE_BYTES,
 ): Record<string, unknown> {
   const size = (): number => Buffer.byteLength(JSON.stringify(payload, null, 2), "utf8");
+  // ONE CURSOR FOR THE FOLD FAMILY (2026-11-16), and it is not a consequence of the bound: a page
+  // that fits still has to say where the next one starts, and `folds` and `objects` are different
+  // lengths, so one number cannot come from both. `nextObjectOffset` used to be the second name
+  // for the same window; it is gone, and the cursor now counts whichever list the caller asked
+  // for. Set before the size check, then again after any shrink, because the primary list's kept
+  // count is what the cursor has to count.
+  const setFoldFamilyCursor = (): void => {
+    if (detail !== "folds" && detail !== "objects") return;
+    const primary = detail === "objects" ? payload.objects : payload.folds;
+    if (!Array.isArray(primary)) return;
+    const total = Number(detail === "objects" ? payload.totalObjects : payload.totalFolds) || 0;
+    payload.nextOffset = offset + primary.length < total ? offset + primary.length : null;
+  };
+  setFoldFamilyCursor();
   if (size() <= cap) return payload;
   const target = cap - STATUS_CONTINUATION_RESERVE_BYTES;
   const fits = (): boolean => size() <= target;
@@ -1349,22 +1361,39 @@ export function boundStatusPayload(
     shrink(lastEpoch, "applied", "applied receipt row(s)", true) +
     shrink(lastEpoch, "absorbed", "absorbed receipt row(s)", true) > 0;
   const rowLabel = (key: string): string => key === "folds" ? "fold row(s)" : key === "objects" ? "object row(s)" : key === "marks" ? "mark row(s)" : "tree row(s)";
-  let continueAt: number | null = null;
-  if (detail === "folds" || detail === "objects") {
+  // ONE CURSOR FOR THE FOLD FAMILY (2026-11-16). `nextObjectOffset` named the same window as
+  // `nextOffset` once both lists are sliced by the same offset and limit, so it is gone. Two
+  // lists sharing one cursor have to resume together, so a page that trimmed either trims both
+  // to the shorter length: a cursor advancing the longer list would repeat rows, one advancing
+  // the shorter would skip them. The mark page keeps `nextMarkOffset`, because a mark list is a
+  // different family and a fold cursor there would send the caller's next `detail: "folds"` call
+  // to a row number from another list.
+  const foldFamily = detail === "folds" || detail === "objects";
+  if (foldFamily) {
     const rideKey = detail === "folds" ? "objects" : "folds";
-    if (shrink(payload, rideKey, rowLabel(rideKey)) > 0) {
-      const rideKept = (payload[rideKey] as unknown[]).length;
-      if (rideKey === "folds") payload.nextOffset = offset + rideKept;
-      else payload.nextObjectOffset = offset + rideKept;
-    }
+    shrink(payload, rideKey, rowLabel(rideKey));
   }
   const primaryKey = detail === "objects" ? "objects" : detail === "tree" ? "tree" : detail === "folds" ? "folds" : detail === "marks" ? "marks" : null;
+  let continueAt: number | null = null;
   if (primaryKey && shrink(payload, primaryKey, rowLabel(primaryKey), false, 1) > 0) {
     continueAt = offset + (payload[primaryKey] as unknown[]).length;
-    // `nextOffset` is the FOLD listing's cursor. A mark page that wrote it would send the
-    // caller's next `detail: "folds"` call to a row number taken from a different list.
-    if (primaryKey === "objects") payload.nextObjectOffset = continueAt;
-    else if (primaryKey === "marks") payload.nextMarkOffset = continueAt;
+  }
+  if (foldFamily) {
+    // THE RIDE YIELDS TO THE PRIMARY LIST (2026-11-16). Both lists share one cursor, so the ride
+    // is trimmed to the primary's kept count — never the reverse, which would delete the rows the
+    // caller asked for in order to keep a convenience list — and the cursor counts the primary,
+    // because `folds` and `objects` are different lengths and one number cannot come from both.
+    // The two arrays are checked separately: past its own end a ride is simply absent, and a page
+    // that treated a missing ride as a reason to skip the cursor would stall the walk.
+    const primaryRows = detail === "objects" ? payload.objects : payload.folds;
+    const rideRows = detail === "objects" ? payload.folds : payload.objects;
+    if (Array.isArray(primaryRows)) {
+      const kept = primaryRows.length;
+      if (Array.isArray(rideRows) && rideRows.length > kept) rideRows.length = kept;
+      setFoldFamilyCursor();
+    }
+  } else if (continueAt !== null) {
+    if (primaryKey === "marks") payload.nextMarkOffset = continueAt;
     else payload.nextOffset = continueAt;
   }
   if (!omitted.length) return payload;
@@ -1521,6 +1550,82 @@ export function foldStoredSpan(input: FoldSourceRequest): unknown[] {
     if (!child) throw new Error(`Missing active-context child ${part.foldId}`);
     return storedChildPlaceholder(child, input.state);
   });
+}
+
+/**
+ * WHERE A RETIRED FOLD'S BYTES WENT (2026-11-16).
+ *
+ * A mark's id becomes its fold's id at commit, so an id handed out by the mark listing keeps
+ * resolving after it is cut. What stops resolving is a fold that was later absorbed by
+ * consolidation or dissolved by a re-cut: measured on 2026-11-16, that is 52 of 66 `peek`
+ * calls in thirty days refusing `Unknown active-context fold`, and the refused tokens were
+ * `fold_…` ids, not entry ids.
+ *
+ * The ledger already holds the answer. Fold records are append-only and content-addressed,
+ * and the reader keeps them by id, so a retired fold's source entries are still on disk. Two
+ * steps recover the successor: an exact hit when a re-cut regenerated the identical parts
+ * (`foldIdFor` is a hash of them), otherwise rank the standing folds by how much of the
+ * retired span they now cover.
+ *
+ * Successors are a LIST, and the reply says so. A re-cut can split one fold across several,
+ * and a singular successor would have to pick one and be wrong about the rest. The list is
+ * uncapped: the status payload's byte bound is what limits a reply, the same as everywhere
+ * else. `MAX_ACTIVE_FOLD_RECORDS` bounds record adoption, so a very old id may have no record
+ * at all — that returns null and the caller keeps the old refusal, which is why the refusal
+ * text has to distinguish a retired fold from an unknown one.
+ */
+export function resolveRetiredFold(input: {
+  foldId: string;
+  state: ActiveContextState;
+  records: Map<string, FoldRecordEntry>;
+}): { id: string; supersededBy: string[] } | null {
+  const record = input.records.get(input.foldId);
+  if (!record) return null;
+  const retired = record.fold;
+  // A re-cut of the same span with the same kind regenerates the same content-addressed id.
+  const exact = foldIdFor(retired.kind, retired.parts);
+  if (exact !== input.foldId && input.state.folds.some((fold) => fold.id === exact)) {
+    return { id: input.foldId, supersededBy: [exact] };
+  }
+  const held = retiredSourceEntryIds(retired, input.records);
+  if (!held.size) return { id: input.foldId, supersededBy: [] };
+  const ranked: Array<{ id: string; overlap: number }> = [];
+  for (const fold of input.state.folds) {
+    if (fold.id === input.foldId) continue;
+    let refs: EvidenceRef[];
+    try {
+      refs = flattenFoldRefs(fold, input.state);
+    } catch {
+      continue;
+    }
+    let overlap = 0;
+    for (const ref of refs) if (held.has(ref.entryId)) overlap += 1;
+    if (overlap > 0) ranked.push({ id: fold.id, overlap });
+  }
+  ranked.sort((a, b) => b.overlap - a.overlap || (a.id < b.id ? -1 : 1));
+  return { id: input.foldId, supersededBy: ranked.map((row) => row.id) };
+}
+
+/** A retired fold's source entries, following child references through the ledger rather than
+ *  the live state — its children were absorbed too, so they are only in the records. */
+function retiredSourceEntryIds(
+  fold: ActiveFold,
+  records: Map<string, FoldRecordEntry>,
+  seen = new Set<string>(),
+): Set<string> {
+  const ids = new Set<string>();
+  if (seen.has(fold.id)) return ids;
+  seen.add(fold.id);
+  for (const part of fold.parts) {
+    if (part.kind === "raw") {
+      ids.add(part.ref.entryId);
+      continue;
+    }
+    const child = records.get(part.foldId);
+    if (!child) continue;
+    for (const id of retiredSourceEntryIds(child.fold, records, seen)) ids.add(id);
+  }
+  return ids;
 }
 
 export function peekFoldSource(input: {

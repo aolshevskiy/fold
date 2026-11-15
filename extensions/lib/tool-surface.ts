@@ -55,6 +55,18 @@ export function buildActiveContextTool(input: {
   if (has("unmark")) {
     rows.push("Reject a cut: unmark withdraws a staged fold so its span stays raw.");
   }
+  if (has("pin")) {
+    // PIN IS THE OPERATOR'S VERB AND THE AGENT'S OBLIGATION (2026-11-16). The scan found
+    // zero agent calls in nineteen days while the editor bound it to keys and the fold bar
+    // printed a pin count: the capability existed and the table never named it. Its cost is
+    // the part a free-bookmark reading misses — a protected span is not reclaimed, so the
+    // commit arrives later and the frontier cuts elsewhere — and that stays a clause here
+    // rather than a paragraph behind the table.
+    rows.push("Keep something in the window across the next fold: pin {\"action\":\"pin\"," +
+      "\"ids\":[\"<fold-or-entry-id>\"]} — holds it against automatic folding, consolidation " +
+      "and refolding; unpin releases it. Pinning frees nothing toward the commit, so it " +
+      "delays one rather than paying for it.");
+  }
   if (has("expand")) {
     rows.push("Put bytes back: expand {\"action\":\"expand\",\"id\":\"<fold-id>\"} restores a span in place, and " +
       "refold reverses it. Expanding costs the window; nothing else here does.");
@@ -65,12 +77,9 @@ export function buildActiveContextTool(input: {
     rows.push("Why the runtime acted: status {\"action\":\"status\",\"detail\":\"diagnostics\"}.");
   }
   const intentTable = rows.length ? ` What you want, and the one call for it:\n- ${rows.join("\n- ")}` : "";
-  // THE DISTINCTIONS A TABLE FLATTENS, and the only prose that survives it.
-  const pinGuidance = has("pin")
-    ? " Pin with ids holds folds or entries against automatic folding, consolidation and refolding, and " +
-      "unpin releases them. Pinning holds a span and frees nothing toward the commit, so it delays one " +
-      "rather than paying for it."
-    : "";
+  // THE DISTINCTIONS A TABLE FLATTENS, and the only prose that survives it. Pin's clause
+  // lives in its row: a capability the table does not name is one no reader finds, which is
+  // exactly what nineteen days of zero agent pin calls measured.
   const rebirthGuidance = has("brief")
     ? " A standing fold's brief is not rewritten, because rewriting it rewrites the projection from that " +
       "placeholder on and costs the prefix cache from there."
@@ -88,8 +97,8 @@ export function buildActiveContextTool(input: {
     name: input.name,
     label: input.label,
     description: input.fullSurface
-      ? `Page, peek, brief, expand, refold, pin, or re-cut exact Pi active-context evidence.${intentTable}${pinGuidance}${rebirthGuidance}${recoveryGuidance}${standingGuidance}${closing}`
-      : `Use only the configured active-context actions: ${input.allowedActions.join(", ")}.${intentTable}${pinGuidance}${rebirthGuidance}${recoveryGuidance}${standingGuidance}${closing}`,
+      ? `Page, peek, brief, expand, refold, pin, or re-cut exact Pi active-context evidence.${intentTable}${rebirthGuidance}${recoveryGuidance}${standingGuidance}${closing}`
+      : `Use only the configured active-context actions: ${input.allowedActions.join(", ")}.${intentTable}${rebirthGuidance}${recoveryGuidance}${standingGuidance}${closing}`,
     parameters: {
       type: "object",
       additionalProperties: false,

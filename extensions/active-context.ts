@@ -34,6 +34,7 @@ import {
   projectionSlateCandidates,
   protectEvidence,
   requireActiveFold,
+  resolveRetiredFold,
   selectAutomaticRung,
   setFoldProjectionState,
   visibleCollapsedFolds,
@@ -4581,25 +4582,14 @@ export function registerActiveContext(pi: any, options: {
       // window and getting two pages.
       const marksPage = detail === "marks";
       const accounting = markAccounting(snapshot, persistence.state);
-      // THE IDS TO BRIEF WITH, ON A PAGE THAT CAN HOLD ALL OF THEM (2026-11-09). The inline
-      // list below is bounded by the byte cap like everything else, so a deep session saw
-      // 21 of 48 marks; the other 27 lost the only reference that makes them briefable, and
-      // `peek briefOnly` needs an id before it can help. This page carries id, kind, tokens
-      // and `briefed` and nothing else, so forty marks cost what ten briefs cost.
-      const pendingRows = pendingMarks(persistence.state).map((mark) => ({
-        id: mark.id,
-        kind: mark.kind,
-        tokens: estimatedTokens(markFreedBytes(snapshot, persistence.state!, mark)),
-        agentBrief: mark.briefProvenance?.kind === "supplied" ||
-          mark.briefProvenance?.kind === "augmented",
-        brief: mark.brief ?? null,
-        briefProvenance: mark.briefProvenance ? clone(mark.briefProvenance) : null,
-      }));
+      // ONE ROW SHAPE FOR THE MARKS (2026-11-16). Two shapes existed for one object family:
+      // a cheap ride (`id`, `kind`, `tokens`, `briefed`, full brief) on every page, and a
+      // recognisable page (`startId`, `endId`, bounded `head`) behind `detail: "marks"`.
+      // Sixty briefs written by hand each needed two calls because the cheap shape carried no
+      // span, so readers paid a page switch for a hundred bytes — and the full brief on the
+      // ride was the mass the byte bound kept trimming. One shape, paged by the same offset as
+      // every other listing: a row a reader can recognise, and no `brief` to swell the page.
       const markRows = pendingMarks(persistence.state).map((mark) => {
-        // A ROW A READER CAN RECOGNISE (2026-11-16). The page carried id, kind, tokens and a
-        // flag, so sixty briefs written by hand each needed two calls: `peek briefOnly` to see
-        // what the mark covered, then `brief` to answer it. The span and a head of the existing
-        // brief belong on the row, and the head is bounded so forty rows still fit one page.
         const refs = markSpanRefs(persistence.state!, mark).refs;
         return {
           id: mark.id,
@@ -4612,6 +4602,9 @@ export function registerActiveContext(pi: any, options: {
           head: mark.brief ? oneLine(mark.brief, MARKS_ROW_BRIEF_CHARS) : null,
         };
       });
+      // THE RIDE IS PAGED, not handed over whole (2026-11-16). It was bounded only by the byte
+      // shrinker, so its depth depended on how much else a page happened to carry. One cursor
+      // for the fold family: the same window every other listing reads.
       const markPageRows = markRows.slice(statusOffset, statusOffset + statusLimit);
       return toolPayload(boundStatusPayload({
         ...activeContextStatus(
@@ -4705,7 +4698,7 @@ export function registerActiveContext(pi: any, options: {
           // from the LIVE state rather than the durable record: a frontier cut is derived
           // from its span and is not written on its own, so the durable record is behind
           // by design and only a brief or a commit brings it forward.
-          ...(marksPage ? {} : { pendingFolds: pendingRows }),
+          ...(marksPage ? {} : { pendingFolds: markPageRows }),
           nativeSummaries: "disabled",
           instrumentation: {
             enabled: true,
@@ -4819,6 +4812,28 @@ export function registerActiveContext(pi: any, options: {
             toolName,
             briefOnly: params.briefOnly === true,
           }));
+        }
+        const retired = resolveRetiredFold({
+          foldId: id,
+          state: persistence.state,
+          records: persistence.persistedFoldRecords,
+        });
+        if (retired) {
+          // A RETIRED ID ANSWERS WITH WHERE THE BYTES WENT, and costs nothing (2026-11-16).
+          // No source is returned, so `admit` never runs and no fence is charged: the caller
+          // peeks a successor if it wants bytes. That is the whole contract of this branch —
+          // a mapping read is free, and a change that started serving source here would
+          // silently change what a read costs.
+          return toolPayload({
+            version: 1,
+            action: "peek",
+            mode: "retired",
+            retired,
+            source: null,
+            note: retired.supersededBy.length
+              ? `That fold is no longer standing. Its bytes are covered by ${retired.supersededBy.join(", ")} — peek one of those for the source. This reply put nothing back in your window, so it costs nothing.`
+              : "That fold is no longer standing and no current fold covers its span, so its bytes went with the boundary that replaced it. Nothing in your window moved.",
+          });
         }
         throw new Error(`Unknown active-context fold ${id}`);
       }
@@ -5140,6 +5155,28 @@ export function registerActiveContext(pi: any, options: {
       const held = pendingMarks(persistence.state!);
       const target = held.find((mark) => mark.id === id);
       if (!target) {
+        // THE SAME MAPPING THE READ PATH GIVES (2026-11-16). Reads and writes answer a
+        // retired id identically, from one resolver: an id that stops resolving is not a
+        // reason to make the caller guess whether the verb or the id was wrong.
+        const retired = resolveRetiredFold({
+          foldId: id,
+          state: persistence.state!,
+          records: persistence.persistedFoldRecords,
+        });
+        if (retired) {
+          return toolPayload({
+            version: 1,
+            action,
+            id,
+            brief: null,
+            provenance: "none",
+            retired,
+            pendingMarks: markAccounting(snapshot, persistence.state!).pending,
+            activation: retired.supersededBy.length
+              ? `That fold is no longer pending: it is covered by ${retired.supersededBy.join(", ")}, and a standing fold's brief is not rewritten. Nothing was written and your window did not move.`
+              : "That fold is no longer pending and no current fold covers its span, so there is nothing to brief. Nothing was written.",
+          });
+        }
         const names = held.slice(0, 5).map((mark) => mark.id).join(", ");
         throw new Error(
           `No pending fold ${id}. ${held.length
