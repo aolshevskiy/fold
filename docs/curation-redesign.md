@@ -77,7 +77,7 @@ The agent no longer chooses spans from nothing. It adjusts what the runtime alre
 - `unmark` withdraws a pending fold that should not be taken.
 - `peek` answers by state: a pending mark returns its brief, a standing fold returns its source. `briefOnly` is a deprecated alias, kept for one release.
 - `brief` also takes `briefs: [{id, brief}, …]`, so a sweep is one call; a stale id comes back refused by name rather than aborting the rest.
-- `status` lost `fold_candidates`, whose payload now rides `diagnostics` as `candidates`.
+- `status` lost `fold_candidates`, whose payload now rides `diagnostics` as `candidates`. The schema enum rejects the retired name before the handler runs, so a caller sees the five that remain; the handler's sentence naming where it went serves in-process callers only.
 - **No read commits.** `expand` used to call the epoch commit whenever anything was staged, which made an idle read a full rewrite of the window. It now rides one only where the occupancy band top already owes it, and the four triggers are the band top, the projection fence, pi's compaction boundary, and an explicit `/fold`.
 
 `fold` as a create-a-mark action is removed.
