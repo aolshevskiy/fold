@@ -20509,6 +20509,11 @@ async function gateRetiredIdResolves() {
   }
   assert(message !== null && /Unknown active-context fold/.test(message),
     `An id nobody wrote down did not keep the old refusal: ${message}`);
+  // TWO KINDS OF UNKNOWN, and the caller can act on only one of them. A retired fold answers with
+  // a mapping; an id the ledger never held says so, because an id from another branch will never
+  // resolve here and retrying it only repeats the incident.
+  assert(/not in this session's ledger/.test(message),
+    `The unknown-id refusal does not distinguish a foreign id from a retired one: ${message}`);
   return { successor, successors: read.retired.supersededBy.length };
 }
 

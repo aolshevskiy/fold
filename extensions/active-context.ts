@@ -4835,7 +4835,17 @@ export function registerActiveContext(pi: any, options: {
               : "That fold is no longer standing and no current fold covers its span, so its bytes went with the boundary that replaced it. Nothing in your window moved.",
           });
         }
-        throw new Error(`Unknown active-context fold ${id}`);
+        // TWO KINDS OF UNKNOWN, SAID OUT LOUD (2026-11-16). A retired fold resolves above and
+        // returns a mapping, so reaching this line means the ledger never held this id at all —
+        // a different situation from "retired, successors lost" and one the caller can act on
+        // differently: an id from another session or branch will never resolve here, and no
+        // number of retries changes that.
+        throw new Error(
+          `Unknown active-context fold ${id}: it is not in this session's ledger — no standing ` +
+          "fold, no pending mark and no durable fold record carries that id, so it was either " +
+          "never written here or belongs to another branch. Read the current set with " +
+          `${toolName} {"action":"status","detail":"folds"} or {"action":"status","detail":"marks"}.`,
+        );
       }
       // A BRIEF-ONLY READ ADMITS NO SOURCE, so it does not pass the fence that governs
       // source: `admit` exists to bound and account the bytes a read puts back into the
