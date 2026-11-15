@@ -1195,11 +1195,13 @@ export function activeContextStatus(
         sourceMapTotal: sourceMap!.total,
         sourceMapTruncated: sourceMap!.truncated,
         paging: {
-          // THREE MODES, ONE INVENTORY (2026-11-16). Six modes meant the same question had
-          // six answers and the caller had to guess which: on 2026-11-15 an agent spent four
-          // status calls across different details looking for the pending set. The inventory
-          // carries folds, raw entries, the tree and the pending marks together, paginated
-          // by one offset; the summary above is the other mode, and diagnostics the third.
+          // FIVE DETAILS AND A SUMMARY (2026-11-16). Six modes meant the same question had six
+          // answers and the caller had to guess which: on 2026-11-15 an agent spent four status
+          // calls across different details looking for the pending set. `fold_candidates` is
+          // retired into diagnostics, so what remains is the bare summary plus these five —
+          // folds, objects, tree, marks, diagnostics — each still its own page and its own
+          // cursor, because merging two families onto one page made the byte bound trim one of
+          // them to nothing (gate 15). The names below are the enum; prose counts drift.
           note: "Results are delivered in bounded pages.",
           folds: { action: "status", detail: "folds", offset: 0, limit: 40 },
           objects: { action: "status", detail: "objects", offset: 0, limit: 40 },
