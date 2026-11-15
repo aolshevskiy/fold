@@ -4864,6 +4864,26 @@ export function registerActiveContext(pi: any, options: {
       return payload;
     }
     if (action === "reboundary") {
+      // A RE-CUT WRITES A BRIEF BY THE STAGED PATH'S RULE, NOT ITS OWN (2026-11-16). This
+      // path commits on the spot, so the text cannot be staged: the fold it names exists the
+      // moment this call returns, and `brief` refuses a standing fold. Removing the argument
+      // therefore does not remove a second *writer* — it removes agent-authored briefs from
+      // the only verb that still names a span (`fold` is deleted), which is a capability loss
+      // with no replacement. So the carry stays and the CONTRACT moves: the same
+      // `briefContractComplaint` that governs a staged brief governs this one.
+      //
+      // VALIDATED BEFORE ANY STATE MOVES, because the first cut of this check ran after the
+      // dissolve: a refused brief left the agent's folds flattened in memory and unpersisted,
+      // a refusal that had already done half its work.
+      const supplied = typeof params.brief === "string" && params.brief.trim()
+        ? params.brief.trim()
+        : undefined;
+      if (supplied !== undefined) {
+        const complaint = briefContractComplaint(
+          supplied, snapshot.policy.agentBriefReserve, snapshot.toolName,
+        );
+        if (complaint !== null) throw new Error(`Supplied brief rejected. ${complaint}`);
+      }
       if (params.ids !== undefined) {
         const requestedIds = stringIds(params.ids);
         const snapped = snapToFoldBoundaries(snapshot, persistence.state, requestedIds);
@@ -4885,22 +4905,6 @@ export function registerActiveContext(pi: any, options: {
         };
         if (!Object.keys(briefs).length) delete flattened.briefs;
         persistence.state = flattened;
-        // A RE-CUT WRITES A BRIEF BY THE STAGED PATH'S RULE, NOT ITS OWN (2026-11-16). This
-        // path commits on the spot, so the text cannot be staged: the fold it names exists
-        // the moment this call returns and `brief` refuses a standing fold. Removing the
-        // argument therefore does not remove a second *writer* — it removes agent-authored
-        // briefs from the only verb that still names a span (`fold` is deleted), which is a
-        // capability loss with no replacement. So the carry stays and the CONTRACT moves:
-        // the same `briefContractComplaint` that governs a staged brief governs this one,
-        // and a refusal here is the same refusal an agent gets from `brief`.
-        const suppliedRaw = typeof params.brief === "string" ? params.brief.trim() : "";
-        const supplied = suppliedRaw ? suppliedRaw : undefined;
-        if (supplied !== undefined) {
-          const complaint = briefContractComplaint(
-            supplied, snapshot.policy.agentBriefReserve, snapshot.toolName,
-          );
-          if (complaint !== null) throw new Error(`Supplied brief rejected. ${complaint}`);
-        }
         const recut = manualFoldCandidate(snapshot, persistence.state, snapped.ids, { allowProtected: true });
         const created: Array<Record<string, unknown>> = [];
         const correctedBriefs: Record<string, string> = {};

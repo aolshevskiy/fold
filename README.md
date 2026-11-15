@@ -61,6 +61,8 @@ Full write-ups, data and logs are on Zenodo ([design](https://doi.org/10.5281/ze
 
 The agent gets one tool, `pi_fold_context`, with actions to `status`, `peek`, `expand`, `refold`, `pin` and `unpin` content, plus `brief`, `reboundary` and `unmark` for curating pending folds. It's all optional; a session that never calls the tool still folds.
 
+`peek` answers by state: a pending mark returns its brief, because its bytes are still raw in the window, and a standing fold returns its source. `brief` takes one clause or many in a single call — `briefs: [{id, brief}, …]` — so a sweep finishes in one call and a stale id is refused by name instead of aborting the rest.
+
 ## Configuration
 
 The defaults are the benchmarked setup, so there's nothing you need to tune.
@@ -87,6 +89,8 @@ The defaults are the benchmarked setup, so there's nothing you need to tune.
 </picture>
 
 **Peek and expand.** `peek` appends a verified, plain-text view of a fold's originals (without thinking blocks or provider metadata) for one turn, then steps aside. `expand` restores the original messages in place until the fold is refolded.
+
+**Reads never commit.** `expand` restores bytes; it does not rewrite the window. A commit fires at the occupancy band top, the projection fence, pi's compaction boundary, or an explicit `/fold` — never because something was read. Before this rule, an idle `expand` at 73% occupancy applied 41 pending marks in a rewrite nobody asked for, 47,544 tokens below the band top.
 
 **Plays well with Pi.** Pi's own compaction stays enabled underneath. Threshold compaction is skipped because folding gets there first, overflow is recovered by folding and retrying, and manual `/compact` still works as an escape hatch.
 

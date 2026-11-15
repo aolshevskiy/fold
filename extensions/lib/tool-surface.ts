@@ -28,29 +28,68 @@ export function buildActiveContextTool(input: {
   defaultPeekBytes: number;
   handler: ToolHandler;
 }) {
-  const peekGuidance = input.allowedActions.includes("peek")
-    ? ` Peek is the point read: it returns one fold's index view -- nested folds' briefs seated shallowest first inside the byte budget with the omitted rows counted, plus the head and tail of that fold's own span with the omitted middle stated -- for any fold id, ancestors still collapsed, changing nothing. It serves ONE level: raw entries come back as plain-text history -- visible text, tool calls with their arguments and tool results verbatim, with thinking blocks and provider metadata left out -- folds nested inside stay placeheld, and peeking a child id you see there returns that child's own bytes, so anything folded is one hop away at any depth. It returns at most ${input.defaultPeekBytes} bytes unless you widen it with bytes, and it is EPHEMERAL by default: the bytes ride only until your next message, your reply then the surviving trace, so extract what your current task needs from them in that reply. Peeking again is lossless and costs one append, so a read you turn out to need twice is cheap; pass ephemeral false when you need the bytes standing across several turns. Expand is the durable in-place restoration.`
+  // THE SURFACE IS A TABLE, NOT AN ESSAY (2026-11-16). It was 7.6KB of prose across seven
+  // paragraphs, and a model could quote a sentence of it and still pick the wrong verb: on
+  // 2026-11-15 an agent spent four status calls and six failed peeks before calling expand,
+  // which then applied 41 folds. Five rows, one call each, and then only the distinctions a
+  // table flattens. Nothing here restates a schema field — the schema already enforces
+  // those, and a prose copy drifts.
+  const has = (action: string): boolean => input.allowedActions.includes(action);
+  const rows: string[] = [];
+  if (has("status")) {
+    rows.push("What is staged, and the ids to brief: status {\"action\":\"status\",\"detail\":\"marks\"} " +
+      "— each row states the mark's span, its size and a head of its brief.");
+  }
+  if (has("peek")) {
+    rows.push("What something holds: peek {\"action\":\"peek\",\"id\":\"<fold-id>\"} — a staged mark answers " +
+      "with its brief, because its bytes are still raw in your window; a standing fold answers with its source.");
+  }
+  if (has("brief")) {
+    rows.push("Write a clause: brief {\"action\":\"brief\",\"briefs\":[{\"id\":\"<fold-id>\",\"brief\":\"…\"}]} " +
+      "— free, because a staged mark is not in your window yet, and several in one call.");
+  }
+  if (has("reboundary")) {
+    rows.push("Change a boundary: reboundary {\"action\":\"reboundary\",\"ids\":[\"<start>\",\"<end>\"]} re-cuts " +
+      "the span into exactly one fold; with a single id it returns that fold's span to raw.");
+  }
+  if (has("unmark")) {
+    rows.push("Reject a cut: unmark withdraws a staged fold so its span stays raw.");
+  }
+  if (has("expand")) {
+    rows.push("Put bytes back: expand {\"action\":\"expand\",\"id\":\"<fold-id>\"} restores a span in place, and " +
+      "refold reverses it. Expanding costs the window; nothing else here does.");
+  }
+  if (has("status")) {
+    rows.push("What is folded, and how much room it costs: status {\"action\":\"status\",\"detail\":\"folds\"}, " +
+      "paged by offset and limit.");
+    rows.push("Why the runtime acted: status {\"action\":\"status\",\"detail\":\"diagnostics\"}.");
+  }
+  const intentTable = rows.length ? ` What you want, and the one call for it:\n- ${rows.join("\n- ")}` : "";
+  // THE DISTINCTIONS A TABLE FLATTENS, and the only prose that survives it.
+  const pinGuidance = has("pin")
+    ? " Pin with ids holds folds or entries against automatic folding, consolidation and refolding, and " +
+      "unpin releases them. Pinning holds a span and frees nothing toward the commit, so it delays one " +
+      "rather than paying for it."
     : "";
-  const correctionGuidance = input.allowedActions.includes("reboundary")
-    ? " Curation is correctable: reboundary with ids re-cuts a span into exactly one fold, which merges adjacent folds when the span covers several and splits one when the span sits inside it. Reboundary with a single id returns that fold's span to raw. A brief is written when you mark the span; a standing fold's brief is not rewritten, because rewriting it rewrites the projection at that fold's placeholder and costs the whole prefix cache from there on."
+  const rebirthGuidance = has("brief")
+    ? " A standing fold's brief is not rewritten, because rewriting it rewrites the projection from that " +
+      "placeholder on and costs the prefix cache from there."
     : "";
-  const pinGuidance = input.allowedActions.includes("pin")
-    ? " Pin with ids holds folds or entries against automatic folding, consolidation and refolding until unpin releases them, so an expanded span you still need stays expanded. Pin reveals nothing on its own: a folded span stays folded, just held. Pinning moves no context bytes, and fold receipts report how much mass you have pinned."
+  const recoveryGuidance = has("expand")
+    ? " A fold brief is an index entry, not the source: when a question or task depends on material that " +
+      "is folded, peek or expand that fold and answer from the exact bytes, never from memory of them."
     : "";
-  const epochGuidance = input.allowedActions.includes("brief")
-    ? " THE RUNTIME CUTS THE FOLDS AND YOU ANNOTATE THEM. As raw material piles up it is cut into pending folds behind you, stalest first. A pending fold moves NO context bytes: you keep seeing the raw material exactly as it is, and the fold reaches your window only when a commit applies it. You are told when folds are cut and which ones carry no brief yet. Answer with brief, one id and one sentence: you know why the span mattered and what you will want back from it, and the deterministic brief that fills the gap reads the span alone and does not. Writing a brief on a pending fold is FREE, because the fold is not in your window yet; briefing a standing fold is refused, because its placeholder is in your window and rewriting it rewrites your context from that point on. reboundary re-cuts a span the runtime got wrong, unmark withdraws a cut you do not want taken, and when to commit stays the runtime's to decide. READING A BRIEF BACK IS A DIFFERENT CALL FROM WRITING ONE: a listing row carries an interval rather than a brief, so peek with briefOnly on a fold id returns the brief, kind, depth, child count and sizes from state for a handful of tokens instead of a window of source. That is the only way to read a brief no placeholder shows, which is the case for every fold a visible parent hides."
-    : "";
-  const listingGuidance = " Listing arrays are byte-bounded so a status page stays small, so a listing may show only its newest rows: when rows are dropped, continuation reports how many of what and gives the exact call that pages the rest, and a truncated pending list arrives as pendingFoldsSample rather than pendingFolds, so the key itself states that it was cut.";
-  const recoveryGuidance = input.allowedActions.includes("expand")
-    ? " A fold brief is an index entry, not the source: when a question or task depends on material that is folded, peek or expand that fold and answer from the exact bytes, never from memory of them. Recalling folded detail without reopening it is how specifics get misremembered."
-    : "";
-  const standingGuidance = " Folding is automatic, lossless and recoverable: the runtime folds stale spans on its own when the window needs room, nothing is ever discarded, and every folded span keeps its exact source. You are never asked to make room and no fold is ever announced in advance. Work normally and let it happen.";
+  const standingGuidance = " Folding is automatic, lossless and recoverable: the runtime folds stale " +
+    "spans when the window needs room, nothing is ever discarded, and no fold is ever announced in " +
+    "advance.";
+  const closing = " Mutations persist immediately and affect the next model call inside the same " +
+    `continuing turn. Supplied fold briefs have a hard ${input.maxBriefChars}-character maximum.`;
   return {
     name: input.name,
     label: input.label,
     description: input.fullSurface
-      ? `Page, peek, brief, expand, refold, pin, or re-cut exact Pi active-context evidence.${peekGuidance}${correctionGuidance}${pinGuidance}${epochGuidance}${listingGuidance}${recoveryGuidance}${standingGuidance} Mutations persist immediately and affect the next model call inside the same continuing turn; no turn boundary is required. Supplied fold briefs have a hard ${input.maxBriefChars}-character maximum.`
-      : `Use only the configured active-context actions: ${input.allowedActions.join(", ")}.${peekGuidance}${correctionGuidance}${pinGuidance}${epochGuidance}${listingGuidance}${recoveryGuidance}${standingGuidance} Supplied fold briefs have a hard ${input.maxBriefChars}-character maximum.`,
+      ? `Page, peek, brief, expand, refold, pin, or re-cut exact Pi active-context evidence.${intentTable}${pinGuidance}${rebirthGuidance}${recoveryGuidance}${standingGuidance}${closing}`
+      : `Use only the configured active-context actions: ${input.allowedActions.join(", ")}.${intentTable}${pinGuidance}${rebirthGuidance}${recoveryGuidance}${standingGuidance}${closing}`,
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -103,11 +142,9 @@ export function buildActiveContextTool(input: {
         },
         briefOnly: {
           type: "boolean",
-          description: "Peek only: return the fold's brief, kind, depth, child count and " +
-            "sizes WITHOUT its source or its descendant index. The cheap read: a listing " +
-            "row no longer repeats a brief, so this is how you read one, at a cost of " +
-            "tokens rather than a window of source. Use a plain peek or expand when you " +
-            "want the evidence itself.",
+          description: "Deprecated, accepted for one release: a plain peek now answers for a " +
+            "pending fold as well, returning its brief with source null. Kept so existing " +
+            "calls keep working; prefer peek with just an id.",
         },
         limit: { type: "integer", minimum: 1, maximum: 100 },
         detail: { type: "string", enum: [...input.statusDetails] },

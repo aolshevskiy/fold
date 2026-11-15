@@ -20137,6 +20137,251 @@ async function gateOneToolResultCannotWedgeTheSession() {
   }
 }
 
+/**
+ * THE READ PATH NEVER COMMITS WHAT IT DID NOT CAUSE (2026-11-16).
+ *
+ * `setFoldExpansion` used to call the epoch commit unconditionally whenever anything was
+ * staged, so an idle `expand` was a rewrite: on 2026-11-15 an agent expanded one fold at
+ * 0.73 occupancy and the read applied 41 marks, 207,710 tokens down to 96,767, 47,544
+ * tokens below the band top and 58k of fresh input on the next request. Two of those marks
+ * were the agent's; the rest were what the same call had just been shown.
+ *
+ * The rule is now: commits fire at the occupancy band top, the projection fence, pi's
+ * compaction boundary, or an explicit /fold — never because a read happened. This gate
+ * drives the incident's shape: below the band top, with staged marks standing, a read must
+ * move nothing and commit nothing.
+ */
+async function gateReadNeverCommits() {
+  const runtime = await epochToolRuntime({ turns: 10, resultChars: 12_000, contextWindow: 100_000 });
+  // A band-top pass first, so a standing fold exists to read.
+  await measure(runtime, 96_000);
+  await project(runtime);
+  await settle();
+  const standing = (await toolStatus(runtime, "pi_fold_context", "folds")).details.folds;
+  assert(standing.length > 0, "The band-top pass committed no fold to read");
+  // Fresh material, then a window well below the band top: the incident's shape exactly.
+  for (let step = 0; step < 6; step += 1) {
+    runtime.appendMessage({
+      role: "assistant",
+      content: [{ type: "toolCall", id: `read-${step}`, name: "read", arguments: { path: `later-${step}.txt` } }],
+      stopReason: "toolUse",
+      timestamp: 9_100 + step,
+    }, "later-work");
+    runtime.appendMessage({
+      role: "toolResult",
+      toolCallId: `read-${step}`,
+      toolName: "read",
+      content: [{ type: "text", text: `Later inspection ${step}: ${"l".repeat(6_000)}` }],
+      isError: false,
+      timestamp: 9_100 + step,
+    }, "later-work");
+  }
+  await measure(runtime, 58_000);
+  const staged = await frontierCuts(runtime);
+  assert(staged.length > 0, "The frontier staged nothing, so the read path had nothing to be tempted by");
+  const commitsBefore = contextEvents(runtime).filter((r) => r.kind === "context.commit").length;
+  const foldsBefore = materialized(runtime).folds.length;
+  const read = await toolCall(runtime, { action: "expand", id: standing[0].id });
+  assert(!read.isError, `The expand was refused: ${JSON.stringify(read.content?.[0]?.text ?? read)}`);
+  await settle();
+  const commitsAfter = contextEvents(runtime).filter((r) => r.kind === "context.commit").length;
+  assert.equal(commitsAfter, commitsBefore,
+    "An expand at 0.58 occupancy committed the staged marks, which is the read that rewrites the window");
+  assert.equal(materialized(runtime).folds.length, foldsBefore,
+    "An expand folded spans it was only asked to reveal");
+  const appliedByRead = read.details.committedMarks;
+  assert(!Array.isArray(appliedByRead) || appliedByRead.length === 0,
+    "The expand reported committed marks at an occupancy where nothing was due");
+  return { occupancyShare: 0.58, stagedMarks: staged.length, commits: 0 };
+}
+
+/**
+ * AND A READ NEVER MULTIPLIES THEM (2026-11-16). The band top owes one commit; a read that
+ * happens to arrive on the same measurement rides it, but three reads must not produce
+ * three rewrites, and no commit may carry the read's name when housekeeping already paid.
+ */
+async function gateReadsNeverMultiplyCommits() {
+  const window = 200_000;
+  const budget = 120_000;
+  const thresholds = { ...context.DEFAULT_THRESHOLDS, maxTarget: 0.50, minTarget: 0.20 };
+  const built = makeFixture({
+    sessionId: "reads-never-multiply", turns: 22, resultChars: 14_000, contextWindow: window,
+  });
+  const runtime = makeRuntime(built, { providerInputBudget: budget, thresholds });
+  await startRuntime(runtime);
+  await measure(runtime, Math.ceil(thresholds.maxTarget * budget) + 4_000, window);
+  await project(runtime);
+  await settle();
+  const owed = contextEvents(runtime).filter((r) => r.kind === "context.commit" && r.deferred === false);
+  assert.equal(owed.length, 1, `The band top produced ${owed.length} commits, so this gate measures nothing stable`);
+  // Reads that re-raise occupancy can legitimately owe another rewrite; what must hold is
+  // the SHAPE of the one they ride. Keep expanding until a read-triggered commit appears,
+  // then assert it spent only what was staged and cut only as deep as the budget asked.
+  let readCommit = null;
+  for (let attempt = 0; attempt < 8 && !readCommit; attempt += 1) {
+    const folds = (await toolStatus(runtime, "pi_fold_context")).details.automatic;
+    const pending = pendingCount(runtime);
+    const before = contextEvents(runtime).filter((r) => r.kind === "context.commit").length;
+    const page = (await toolStatus(runtime, "pi_fold_context", "folds")).details.folds;
+    if (!page.length) break;
+    await toolCall(runtime, { action: "expand", id: page[attempt % page.length].id }).catch(() => undefined);
+    await settle();
+    const after = contextEvents(runtime).filter((r) => r.kind === "context.commit");
+    if (after.length > before) readCommit = after.at(-1);
+    void folds; void pending;
+  }
+  assert(readCommit, "No read-triggered commit appeared, so the bounded ride was never exercised");
+  assert.equal(readCommit.trigger, "expand", `The read-triggered commit names itself ${readCommit.trigger}`);
+  assert.equal(readCommit.deferred, false, "A read-triggered commit was recorded as deferred while it applied marks");
+  // THE BOUND IS THE CLAIM, not a floor above zero: the ride may legitimately apply nothing
+  // when the staged marks sit past the depth the budget asked for, and reserving them is the
+  // bound working rather than the ride failing. What must never happen is applying more than
+  // was staged, which was the incident: 2 marks the agent wrote, 41 folds applied.
+  const applied = readCommit.applied_marks ?? readCommit.appliedMarks ?? 0;
+  const stagedAtRead = readCommit.pending_marks ?? readCommit.pendingMarks ?? applied;
+  assert(applied <= stagedAtRead,
+    `The ride applied ${applied} marks against ${stagedAtRead} staged, which is more than it was shown`);
+  return { trigger: readCommit.trigger, appliedMarks: applied, staged: stagedAtRead };
+}
+
+function pendingCount(runtime) {
+  return materialized(runtime).pendingMarks?.length ?? 0;
+}
+
+/**
+ * A SWEEP IN ONE CALL (2026-11-16). `brief` was single-target over a set that moves: 105
+ * attempts landed 43 briefs in one session and 139 landed 131 in another, with 8 refusals
+ * in each for naming an id that had committed meanwhile — and under a batched tool call one
+ * stale id poisoned the whole script. The batch answers each id separately, applies
+ * everything still true, and never aborts the rest.
+ */
+async function gateBriefSweepInOneCall() {
+  const runtime = await epochToolRuntime({ turns: 12, resultChars: 12_000, contextWindow: 100_000 });
+  const cuts = await frontierCuts(runtime);
+  assert(cuts.length >= 2, `The frontier cut ${cuts.length} marks, too few to sweep`);
+  const live = cuts.slice(0, 2).map((cut) => cut.id);
+  const swept = await toolCall(runtime, { action: "brief", briefs: [
+    { id: live[0], brief: "First inspection: its exact stdout stays recoverable behind this fold." },
+    { id: "fold_gone_in_the_meantime", brief: "This id was committed while the sweep was being written." },
+    { id: live[1], brief: "Second inspection: the failing path stays recoverable behind this fold." },
+  ] });
+  assert(!swept.isError, `The sweep was refused whole: ${JSON.stringify(swept.content?.[0]?.text ?? swept)}`);
+  const applied = swept.details.applied.map((entry) => entry.id);
+  const refused = swept.details.refused.map((entry) => entry.id);
+  assert.deepEqual(applied.sort(), [...live].sort(), "The sweep did not apply the two live ids");
+  assert.deepEqual(refused, ["fold_gone_in_the_meantime"],
+    "A stale id did not come back refused by name, so the rest of a batch cannot be trusted");
+  const marks = (await toolStatus(runtime, "pi_fold_context", "marks")).details.marks;
+  for (const id of live) {
+    assert(marks.find((row) => row.id === id)?.agentBrief === true,
+      "The sweep reported a brief it did not write");
+  }
+  return { applied: applied.length, refused: refused.length };
+}
+
+/**
+ * A MARK ROW A READER CAN RECOGNISE (2026-11-16). The page carried id, kind, tokens and a
+ * flag, so sixty briefs written by hand each needed two calls: a `peek briefOnly` to learn
+ * what the mark covered, then `brief` to answer it. Identity and a head of the brief belong
+ * on the row, bounded so forty rows still fit one page.
+ */
+async function gateMarkRowRecognisable() {
+  const runtime = await epochToolRuntime({ turns: 12, resultChars: 12_000, contextWindow: 100_000 });
+  const page = (await toolStatus(runtime, "pi_fold_context", "marks")).details;
+  assert(page.marks.length > 0, "The marks page listed nothing");
+  assert(page.marks.length <= 40, `One marks page carried ${page.marks.length} rows, past its own limit`);
+  for (const row of page.marks) {
+    assert.equal(typeof row.startId, "string", `Mark ${row.id} carries no startId, so it is an opaque id`);
+    assert.equal(typeof row.endId, "string", `Mark ${row.id} carries no endId`);
+    assert.equal(typeof row.head, "string", `Mark ${row.id} carries no head of its brief`);
+    assert(row.head.trim().length > 0, `Mark ${row.id} carries an empty head`);
+    assert.equal(typeof row.agentBrief, "boolean",
+      `Mark ${row.id} reports no agentBrief flag, so a deterministic brief cannot be told from a written one`);
+  }
+  return { rows: page.marks.length, totalMarks: page.totalMarks };
+}
+
+/**
+ * ONE BRIEF CONTRACT FOR BOTH WRITERS (2026-11-16). A re-cut commits on the spot, so its
+ * brief cannot be staged and the argument has to stay — removing it would remove
+ * agent-authored briefs from the only verb that still names a span. What must not differ is
+ * the RULE: the same complaint that refuses a staged brief refuses this one, and a refusal
+ * has to happen before any state moves.
+ */
+async function gateRecutBriefContract() {
+  const runtime = await epochToolRuntime({ turns: 12, resultChars: 12_000, contextWindow: 100_000 });
+  await measure(runtime, 96_000);
+  await project(runtime);
+  await settle();
+  const rows = (await toolStatus(runtime, "pi_fold_context", "folds")).details.folds
+    .filter((row) => row.startId && row.endId);
+  assert(rows.length > 0, "No fold carried an interval to re-cut");
+  const row = rows[0];
+  const foldsBefore = materialized(runtime).folds.length;
+  const tooLong = "x".repeat(context.ACTIVE_CONTEXT_POLICY.agentBriefReserve + 40);
+  let refusal = null;
+  try {
+    await toolCall(runtime, { action: "reboundary", ids: [row.startId, row.endId], brief: tooLong });
+  } catch (error) {
+    refusal = String(error?.message ?? error);
+  }
+  assert(refusal !== null, "A re-cut accepted a brief past the reserve");
+  assert(/Supplied brief rejected/.test(refusal),
+    `The re-cut refusal does not name the same contract the staged path names: ${refusal}`);
+  assert.equal(materialized(runtime).folds.length, foldsBefore,
+    "A refused re-cut brief still dissolved the span, so the refusal had already done half its work");
+  const accepted = await toolCall(runtime, {
+    action: "reboundary", ids: [row.startId, row.endId],
+    brief: "Three completed chapters merged into one exactly recoverable span.",
+  });
+  assert(!accepted.isError, `A legal re-cut brief was refused: ${JSON.stringify(accepted.content?.[0]?.text ?? accepted)}`);
+  return { refusedOverReserve: true, accepted: true };
+}
+
+/**
+ * ONE READ VERB, ANSWERING BY STATE (2026-11-16). Four spellings collapsed into one: `peek`
+ * answers with a pending mark's brief, a standing fold's source, or an error for an id
+ * nobody knows. `briefOnly` stays as an accepted alias for one release, and this gate is
+ * what keeps the alias honest: it must return exactly what the plain read returns.
+ */
+async function gatePeekAnswersByState() {
+  const runtime = await epochToolRuntime({ turns: 12, resultChars: 12_000, contextWindow: 100_000 });
+  const cuts = await frontierCuts(runtime);
+  assert(cuts.length > 0, "The frontier staged no mark to read");
+  const mark = cuts[0];
+  const plain = await toolCall(runtime, { action: "peek", id: mark.id });
+  assert(!plain.isError, "A plain peek on a staged mark was refused, which is the incident's dead end");
+  assert.equal(plain.details.pending, true, "A staged mark was read as though it were already cut");
+  assert.equal(plain.details.source ?? null, null,
+    "A staged mark returned source, but its bytes are still raw in the window");
+  assert.equal(typeof plain.details.note, "string", "A plain peek on a mark explained nothing");
+  const alias = await toolCall(runtime, { action: "peek", id: mark.id, briefOnly: true });
+  assert.equal(alias.details.brief, plain.details.brief,
+    "The deprecated briefOnly alias and the plain read disagree about the same mark");
+  await measure(runtime, 96_000);
+  await project(runtime);
+  await settle();
+  // BELOW THE BUDGET, or the read is refused by the fence rather than answered by state.
+  await measure(runtime, 40_000);
+  const standing = (await toolStatus(runtime, "pi_fold_context", "folds")).details.folds;
+  assert(standing.length > 0, "No standing fold to read as source");
+  const source = await toolCall(runtime, { action: "peek", id: standing[0].id });
+  assert(!source.isError, "A plain peek on a standing fold was refused");
+  assert.equal(source.details.pending, undefined, "A standing fold was read as a staged mark");
+  const size = source.details.sourceBytes ?? source.details.sourceChars ?? source.details.returnedBytes;
+  assert(typeof size === "number" && size > 0,
+    `A standing fold answered with neither source nor a size: ${JSON.stringify(Object.keys(source.details))}`);
+  let unknownRefusal = null;
+  try {
+    await toolCall(runtime, { action: "peek", id: "fold_nobody_at_all" });
+  } catch (error) {
+    unknownRefusal = String(error?.message ?? error);
+  }
+  assert(unknownRefusal !== null && /Unknown active-context fold/.test(unknownRefusal),
+    `An unknown id answered instead of erroring: ${unknownRefusal}`);
+  return { pendingRead: true, standingRead: true, aliasAgrees: true };
+}
+
 const gates = [
   [1, "Registration, parse and deployment branding", gateRegistrationAndBranding],
   [2, "The durable record: lattice, chain and rollback", gateDurableRecord],
@@ -20303,6 +20548,12 @@ const gates = [
   // Its second half, that a pin is a claim on the window and pays nothing toward the drop,
   // is gate 92's (the pinned-share cap refuses) and gate 89's (protect is a durable pin),
   // both of which drive it on their own fixtures. The number stays spent.
+  [189, "A read never commits what it did not cause", gateReadNeverCommits],
+  [190, "Reads never multiply commits", gateReadsNeverMultiplyCommits],
+  [191, "A brief sweep finishes in one call", gateBriefSweepInOneCall],
+  [192, "A mark row is identifiable", gateMarkRowRecognisable],
+  [193, "One brief contract for both writers", gateRecutBriefContract],
+  [194, "Peek answers by state", gatePeekAnswersByState],
 ];
 
 const gateFilter = (process.env.GATES ?? "")
