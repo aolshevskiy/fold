@@ -39,9 +39,9 @@ import {
  * whether it was measured or estimated rather than presenting either as the other.
  */
 export function foldNoticeText(input: {
-  staged: ReadonlyArray<{ id: string; kind: string; tokens: number; brief?: string; briefed?: boolean }>;
+  staged: ReadonlyArray<{ id: string; kind: string; tokens: number; brief?: string; agentBrief?: boolean }>;
   freedTokens: number;
-  briefedCount: number;
+  agentBriefCount: number;
   pinnedEntries: number;
   pinnedShare: number;
   maxPinnedShare: number;
@@ -67,7 +67,7 @@ export function foldNoticeText(input: {
       `about ${n(input.headroomTokens)} tokens of headroom left ` +
       `(${input.measured ? "provider-measured" : "estimated; no provider count yet"}).`,
     `Staged: ${n(input.staged.length)} fold${input.staged.length === 1 ? "" : "s"}` +
-      `, ${n(input.briefedCount)} carrying a brief you wrote` +
+      `, ${n(input.agentBriefCount)} carrying a brief you wrote` +
       `, freeing about ${n(input.freedTokens)} tokens when the commit applies them.`,
   ];
   if (input.pinnedEntries > 0) {
@@ -97,7 +97,7 @@ export function foldNoticeText(input: {
   const NOTICE_ROW_CHARS = 160;
   const entries = input.staged
     .map((fold) => `${fold.id} (${fold.kind}, ~${fold.tokens} tokens` +
-      `${fold.briefed ? ", briefed" : ""})` +
+      `${fold.agentBrief ? ", agent brief" : ""})` +
       (fold.brief ? `: ${oneLine(fold.brief, NOTICE_ROW_CHARS)}` : ""));
   // THE POINTER NAMES THE PAGE THAT HOLDS THE ROWS (2026-11-09). It used to say
   // `{"action":"status"} lists the other N`, which is true only through that page's
@@ -105,15 +105,15 @@ export function foldNoticeText(input: {
   // one row. So the sentence counted 67 rows and pointed at a summary holding one, which
   // is the same laundering the continuation exists to prevent, one hop further out. The
   // exact call travels instead of a description of one, because a reader copies it.
-  const overflowText = (seated: number) =>
+  const overflowText = () =>
     `${input.toolName} {"action":"status","detail":"marks"} lists all ${input.staged.length}.`;
   let seated = entries.length;
   let list = `Staged spans: ${entries.join("; ")}.`;
   while (seated > 0 && Buffer.byteLength(`${head}\n${list}`, "utf8") > FOLD_NOTICE_BYTES) {
     seated -= 1;
     list = seated === 0
-      ? overflowText(0)
-      : `Staged spans: ${entries.slice(0, seated).join("; ")}. ${overflowText(seated)}`;
+      ? overflowText()
+      : `Staged spans: ${entries.slice(0, seated).join("; ")}. ${overflowText()}`;
   }
   return boundReceiptText(`${head}\n${list}`, FOLD_NOTICE_BYTES,
     `[${brand} folds] A commit is approaching; the staged list is unavailable this pass.`);

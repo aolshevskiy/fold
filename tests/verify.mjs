@@ -2091,7 +2091,7 @@ async function gateFoldCandidatesDetail() {
     !String(entry.customType ?? "").endsWith("-context-event"));
   const branchBefore = json.stableStringify(durableEntries(runtime.branch));
   const appendedBefore = durableEntries(runtime.appended).length;
-  const status = await toolStatus(runtime, "pi_fold_context", "fold_candidates");
+  const status = await toolStatus(runtime, "pi_fold_context", "diagnostics");
   assert.equal(json.stableStringify(status.details.candidates), json.stableStringify(expected));
   assert.equal(status.details.automatic.measurementFresh, false);
   assert.equal(status.details.candidates.wouldFireNow, null);
@@ -2514,7 +2514,7 @@ async function gatePeekAndFoldIndex() {
   const plain = await toolStatus(runtime, "pi_fold_context");
   assert.equal(plain.details.tree, undefined);
   assert.equal(plain.details.totalFolds, 3);
-  const candidates = await toolStatus(runtime, "pi_fold_context", "fold_candidates");
+  const candidates = await toolStatus(runtime, "pi_fold_context", "diagnostics");
   assert.equal(candidates.details.tree, undefined);
   assert(candidates.details.candidates);
 
@@ -3145,7 +3145,7 @@ async function gateEpochQuotaTopUp() {
     "The completed first inspection is stale and its exact output stays recoverable.");
   assert.equal(briefed.details.action, "brief");
   assert.equal(briefed.details.provenance, "agent");
-  assert.equal((await frontierCuts(runtime)).filter((fold) => fold.briefed).length, 1);
+  assert.equal((await frontierCuts(runtime)).filter((fold) => fold.agentBrief).length, 1);
 
   await measureAndCommit(runtime, 88_500, 100_000, "quota-round");
   const status = await toolStatus(runtime, "pi_fold_context", "diagnostics");
@@ -3686,7 +3686,7 @@ async function gateStatusIndexDiet() {
   const pagedFoldsResult = await toolStatus(lean, "pi_fold_context", "folds");
   const leanStatus = leanResult.details;
   const pagedFolds = pagedFoldsResult.details;
-  const pagedObjects = (await toolStatus(lean, "pi_fold_context", "objects")).details;
+  const pagedObjects = (await toolStatus(lean, "pi_fold_context", "folds")).details;
   assert(leanStatus.totalFolds >= 3, "The fixture built too small an index to measure");
 
   // The tree and the object list stop riding along; the counts stay, and the full
@@ -3723,7 +3723,7 @@ async function gateStatusIndexDiet() {
 
   // The full tree stays reachable, explicitly and paged, and never auto-injected.
   const schema = [...lean.tools.values()][0].parameters.properties.detail.enum;
-  assert.deepEqual([...schema], ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"]);
+  assert.deepEqual([...schema], ["folds", "objects", "tree", "marks", "diagnostics"]);
   assert(pagedFolds.folds.length >= 1);
   assert.equal(pagedFolds.index, undefined);
   assert.deepEqual(
@@ -3849,11 +3849,11 @@ async function gateStatusIndexDiet() {
   // The paged details are part of the surface, and an unknown one still names the set.
   assert.deepEqual(
     [...[...lean.tools.values()][0].parameters.properties.detail.enum],
-    ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"],
+    ["folds", "objects", "tree", "marks", "diagnostics"],
   );
   await assert.rejects(
     () => toolCall(lean, { action: "status", detail: "everything" }),
-    /status detail must be one of 'fold_candidates', 'tree', 'folds', 'objects', 'marks', 'diagnostics'/,
+    /status detail must be one of 'folds', 'objects', 'tree', 'marks', 'diagnostics'/,
   );
 
   return {
@@ -6208,7 +6208,7 @@ async function gateContextEventStream() {
     .map((entry) => entry.data);
 
   await toolCall(runtime, { action: "status" });
-  await toolCall(runtime, { action: "status", detail: "fold_candidates" });
+  await toolCall(runtime, { action: "status", detail: "diagnostics" });
   // Two refusals, through the two verbs that still take names: a brief for a fold nobody
   // cut, and a re-cut of a span nobody has.
   await toolCall(runtime, { action: "brief", id: "no-such-entry", brief: "x" }).catch(() => undefined);
@@ -7156,7 +7156,7 @@ async function gateStatusPagesAreBounded() {
   // defect the move removes. Presence is asserted exactly where truncation is forced: the
   // listing walks below, and the small-session block below that states the converse.
   const measured = {};
-  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"]) {
+  for (const detail of [undefined, "folds", "objects", "tree", "marks", "diagnostics"]) {
     const result = await toolStatus(runtime, "pi_fold_context", detail);
     const delivered = Buffer.byteLength(result.content[0].text, "utf8");
     assert(delivered <= context.CONTEXT_STATUS_RESPONSE_BYTES,
@@ -7224,7 +7224,7 @@ async function gateStatusPagesAreBounded() {
   // whole and unmarked.
   const small = makeRuntime(makeFixture({ turns: 2, resultChars: 400, contextWindow: 100_000 }));
   await startRuntime(small);
-  for (const detail of [undefined, "fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"]) {
+  for (const detail of [undefined, "folds", "objects", "tree", "marks", "diagnostics"]) {
     const result = await toolStatus(small, "pi_fold_context", detail);
     assert(Buffer.byteLength(result.content[0].text, "utf8") <= context.CONTEXT_STATUS_RESPONSE_BYTES);
     assert.equal(result.details.continuation, undefined,
@@ -7356,7 +7356,7 @@ async function gateStatusPagesAreBounded() {
     cap: context.CONTEXT_STATUS_RESPONSE_BYTES,
     folds: allFoldIds.length,
     pageBytes: measured,
-    foldPages: walks.folds.pages.length,
+    foldPages: walks.tree.pages.length,
     treePages: walks.tree.pages.length,
   };
 }
@@ -7396,7 +7396,7 @@ async function gateStatusResultsAreLadderFood() {
       "pi_fold_context", { action: "peek", id: "fold_probe", offset: 12_000, expand: true }),
     false,
     "An argument outside the peek surface classified as ladder food");
-  assert.equal(context.isAutoFoldableToolCall("pi_fold_context", { action: "status", detail: "tree" }), true);
+  assert.equal(context.isAutoFoldableToolCall("pi_fold_context", { action: "status", detail: "folds" }), true);
   // Classification is allowlist-driven: one argument outside the surface and the
   // batch is unsafe, which is exactly how the detail-carrying shape was rejected
   // before 'detail' joined the list above.
@@ -9164,7 +9164,7 @@ async function gateLadderFillsWhatTheAgentLeft() {
   const cutProjection = await project(quiet);
   await settle();
   assert(cut.length >= 1, "The frontier cut nothing on a window full of raw material");
-  assert(cut.every((mark) => mark.briefed === false),
+  assert(cut.every((mark) => mark.agentBrief === false),
     "A frontier cut arrived already briefed, so the agent has nothing to add");
   // AND THE CUT IS BYTE-INERT. The agent still sees every raw byte the cut covers, no
   // placeholder stands in for any of it, and nothing names the pending mark. This is the
@@ -10891,7 +10891,7 @@ async function gateNoFoldWithoutABrief() {
       `Frontier cut ${cut.id} was made with no brief at all`);
     assert.equal(cut.briefProvenance.kind, "deterministic",
       "A deterministic fill was recorded as though the agent had written it");
-    assert.equal(cut.briefed, false);
+    assert.equal(cut.agentBrief, false);
   }
 
   // THE MARK LIST KEEPS ITS BRIEFS (2026-11-09). Listings stopped carrying briefs because
@@ -10964,10 +10964,24 @@ async function gateNoFoldWithoutABrief() {
     () => toolCall(runtime, { action: "peek", id: "fold_nobody_at_all", briefOnly: true }),
     /Unknown active-context fold/,
   );
-  await assert.rejects(
-    () => toolCall(runtime, { action: "peek", id: walkedMarks[0].id }),
-    /Unknown active-context fold/,
-  );
+  // A PLAIN PEEK ANSWERS TOO (2026-11-16). `briefOnly` used to be the only way in and no row
+  // mentioned it: six plain peeks on listed mark ids each threw 'Unknown active-context fold'
+  // on 2026-11-15, and the agent then called `expand`, which applied 41 folds. The read a
+  // caller reaches for first answers what exists (the brief) and says what does not (source),
+  // and it admits no bytes, so the fence never sees it.
+  const plainMarkRead = (await toolCall(runtime, { action: "peek", id: walkedMarks[0].id })).details;
+  const briefOnlyRead = (await toolCall(
+    runtime,
+    { action: "peek", id: walkedMarks[0].id, briefOnly: true },
+  )).details;
+  assert.equal(plainMarkRead.pending, true, "A plain peek did not report the mark as pending");
+  assert.equal(plainMarkRead.state, "pending");
+  assert.equal(plainMarkRead.source ?? null, null,
+    "A staged mark returned source, but its bytes are still raw in the window");
+  assert.equal(typeof plainMarkRead.note, "string",
+    "A plain peek on a mark must say why there is no source, not stay silent about it");
+  assert.equal(plainMarkRead.brief, briefOnlyRead.brief,
+    "The plain read and the brief-only read disagree about the same mark");
 
   // SUPPLIED: kept verbatim, and it REPLACES the deterministic fill rather than joining it.
   const supplied = "The second inspection is stale; its exact stdout and the failing path stay recoverable.";
@@ -13748,7 +13762,7 @@ async function gateFoldNoticeStatesTheApproach() {
       id: `fold_${String(index).padStart(24, "0")}`, kind: "tool-result", tokens: 2_130,
     })),
     freedTokens: count * 2_130,
-    briefedCount: 0,
+    agentBriefCount: 0,
     pinnedEntries: 0,
     pinnedShare: 0,
     maxPinnedShare: context.MAX_PINNED_SHARE,

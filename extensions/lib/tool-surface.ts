@@ -68,6 +68,24 @@ export function buildActiveContextTool(input: {
             `brief, never instead of it, at most ${input.maxBriefChars} characters. Free ` +
             "to write, because the fold it names is not in your window yet.",
         },
+        briefs: {
+          type: "array",
+          minItems: 1,
+          maxItems: 64,
+          description: "Brief only: several clauses in ONE call, as [{id, brief}, ...]. " +
+            "Use this for a sweep: the pending set moves while you write, so one id at a " +
+            "time cannot finish it. Every id is answered separately — a stale or unknown " +
+            "id is refused by name and never aborts the rest.",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["id", "brief"],
+            properties: {
+              id: { type: "string", minLength: 1 },
+              brief: { type: "string", minLength: 1, maxLength: input.maxBriefChars },
+            },
+          },
+        },
         offset: { type: "integer", minimum: 0 },
         ephemeral: {
           type: "boolean",

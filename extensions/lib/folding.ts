@@ -1194,16 +1194,17 @@ export function activeContextStatus(
         sourceMapTotal: sourceMap!.total,
         sourceMapTruncated: sourceMap!.truncated,
         paging: {
+          // THREE MODES, ONE INVENTORY (2026-11-16). Six modes meant the same question had
+          // six answers and the caller had to guess which: on 2026-11-15 an agent spent four
+          // status calls across different details looking for the pending set. The inventory
+          // carries folds, raw entries, the tree and the pending marks together, paginated
+          // by one offset; the summary above is the other mode, and diagnostics the third.
           note: "Results are delivered in bounded pages.",
           folds: { action: "status", detail: "folds", offset: 0, limit: 40 },
           objects: { action: "status", detail: "objects", offset: 0, limit: 40 },
           tree: { action: "status", detail: "tree", offset: 0 },
-          // THE IDS TO BRIEF WITH HAVE A PAGE OF THEIR OWN (2026-11-09). The inline
-          // `pendingFolds` array is bounded like everything else, so a deep session saw
-          // 21 of 48 marks and the remaining 27 lost the only reference that makes them
-          // briefable: there was no page to reach them by, and `peek briefOnly` needs an
-          // id first. id/kind/tokens/briefed only, so a page holds 40 marks rather than 10.
           marks: { action: "status", detail: "marks", offset: 0, limit: 40 },
+          diagnostics: { action: "status", detail: "diagnostics", offset: 0, limit: 40 },
         },
       }
       : {
@@ -1544,7 +1545,14 @@ export function peekFoldSource(input: {
   // because there is no fold yet — rather than a shape borrowed from one that exists.
   if (!fold) {
     const mark = (input.state.pendingMarks ?? []).find((item) => item.id === input.foldId);
-    if (mark && input.briefOnly) {
+    // A PENDING MARK ANSWERS IN BOTH MODES (2026-11-16). `briefOnly` used to be the only
+    // way in, and nothing a reader saw mentioned that switch: on 2026-11-15 an agent peeked
+    // six ids the marks page had just handed it, got 'Unknown active-context fold' from
+    // every one, and fell back to `expand` — the call that committed 41 folds. The read a
+    // caller reaches for first is the plain one, so the plain one answers; what it returns
+    // is what exists (a brief) and what does not (no source, because the bytes are still
+    // raw in the window), and it says which is which rather than erroring.
+    if (mark) {
       const folded = mark.mark === "fold" ? mark : null;
       return {
         version: 1,
@@ -1560,6 +1568,13 @@ export function peekFoldSource(input: {
         briefProvenance: folded?.briefProvenance ? { ...folded.briefProvenance } : null,
         sourceCount: folded ? folded.parts.length : null,
         state: "pending",
+        ...(input.briefOnly ? {} : {
+          source: null,
+          note: "this mark is staged, not folded: its bytes are still raw in your context, so " +
+            "there is no source to return. The brief above is what will be stored with it; " +
+            "read the raw span by its entry ids, or write your own clause with " +
+            `{"action":"brief","id":"${mark.id}","brief":"..."}`,
+        }),
         wider: { status: { action: "status", detail: "marks" } },
       };
     }

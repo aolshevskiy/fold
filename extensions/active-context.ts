@@ -235,6 +235,14 @@ import {
 
 export type ProjectionReadingBasis = "anchored" | "rewritten" | "unmeasured" | "refused";
 
+/**
+ * HOW MUCH OF A STAGED MARK'S BRIEF A MARKS ROW CARRIES (2026-11-16). A row has to say what
+ * the mark covers or the reader has to spend a call finding out; it must not become a page of
+ * briefs either. Eighty characters is enough to recognise a span and keeps forty rows on one
+ * status page, which is the bound the page exists to satisfy.
+ */
+const MARKS_ROW_BRIEF_CHARS = 80;
+
 export * from "./lib/canonical.ts";
 export * from "./lib/curation.ts";
 export * from "./lib/folding.ts";
@@ -2468,7 +2476,7 @@ export function registerActiveContext(pi: any, options: {
     // anchor back to the estimate. A carrier that moves on a quiet pass costs the cache,
     // which is the one thing this design exists to avoid.
     if (!carrierAdmitted("fold-notice")) return projected;
-    const briefed = (mark: Record<string, unknown>): boolean =>
+    const agentBriefed = (mark: Record<string, unknown>): boolean =>
       (mark as any).briefProvenance?.kind === "supplied" ||
       (mark as any).briefProvenance?.kind === "augmented";
     const staged = held.map((mark) => ({
@@ -2476,7 +2484,7 @@ export function registerActiveContext(pi: any, options: {
       kind: mark.kind as string,
       tokens: estimatedTokens(markFreedBytes(snapshot, persistence.state!, mark)),
       brief: typeof mark.brief === "string" ? mark.brief : undefined,
-      briefed: briefed(mark),
+      agentBrief: agentBriefed(mark),
     }));
     // THE SHARE IS MEASURED THE WAY THE CAP MEASURES IT. The notice states the pinned
     // share against MAX_PINNED_SHARE, and `applyProtectionChange` refuses past that cap
@@ -2485,7 +2493,7 @@ export function registerActiveContext(pi: any, options: {
     const text = foldNoticeText({
       staged,
       freedTokens: staged.reduce((total, fold) => total + fold.tokens, 0),
-      briefedCount: staged.filter((fold) => fold.briefed).length,
+      agentBriefCount: staged.filter((fold) => fold.agentBrief).length,
       pinnedEntries: pinnedMass.refs,
       pinnedShare: estimatedTokens(pinnedMass.bytes) / capacity.budgetTokens,
       maxPinnedShare: MAX_PINNED_SHARE,
@@ -2499,7 +2507,7 @@ export function registerActiveContext(pi: any, options: {
     emit("context.frontier", {
       cut: 0,
       pending_marks: held.length,
-      briefed: staged.filter((fold) => fold.briefed).length,
+      agent_brief: staged.filter((fold) => fold.agentBrief).length,
       occupancy_share: Number(share.toFixed(4)),
       fire_point_share: firePoint,
       measured,
@@ -4293,16 +4301,29 @@ export function registerActiveContext(pi: any, options: {
     expand: boolean,
     ctx: any,
   ): Promise<unknown[]> => {
+    // A READ NEVER COMMITS WHAT IT WOULD NOT HAVE CAUSED ALONE (2026-11-16).
+    //
+    // This path used to call `commitPendingMarks` unconditionally whenever anything was
+    // staged, which made an idle `expand` an epoch commit: on 2026-11-15 an agent looking
+    // for something to do expanded one fold at 0.73 occupancy and the call applied 41 marks
+    // in a rewrite it never asked for — 207,710 tokens to 96,767, 47,544 tokens below the
+    // band top, 58k of fresh input on the next request. Two marks were the agent's; the
+    // other thirty-nine were what the same tool call had just been shown.
+    //
+    // The rule now: a commit fires from the occupancy band top (`epochCommitDue`), the
+    // projection fence, pi's compaction boundary, or an explicit /fold — never because a
+    // read happened. When the band top IS due, the read rides the rewrite that was already
+    // coming, which is a saving rather than a cost, and the ride is bounded like any other
+    // housekeeping commit: `topUp: false` so it spends only what is staged instead of
+    // minting a cut it was never asked for, and a null waiverRatio so `applyTargetBytes`
+    // arms the depth bound. A spent handoff budget is a silent skip, not a deferral record.
     let epochApplied: unknown[] = [];
-    if (expand && pendingMarks(persistence.state!).length) {
-      const result = await commitPendingMarks({
-        snapshot,
-        state: persistence.state!,
-        generation: lifecycle.generation,
-        retainIneligible: true,
-      });
-      persistence.state = result.state;
-      epochApplied = result.applied;
+    if (expand && pendingMarks(persistence.state!).length &&
+        epochCommitDue(snapshot, measurements.latestRatio) &&
+        instrumentation.mutationsSinceHandoff === 0) {
+      const epoch = await runCommitEpoch(snapshot, "expand", false, null, false);
+      const applied = epoch?.applied;
+      epochApplied = Array.isArray(applied) ? applied : [];
     }
     const expanding = requireActiveFold(snapshot, persistence.state!, id);
     if (expand) {
@@ -4526,9 +4547,22 @@ export function registerActiveContext(pi: any, options: {
     const snapshot = authoritativeSnapshotFor(ctx);
     if (action === "status") {
       const detail = ownValue(params, "detail");
-      const details = ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"];
+      // THREE MODES, NOT SIX (2026-11-16). Every retired name answered with a page whose
+      // shape overlapped its neighbour's, so choosing between them was a guess: the incident
+      // session spent four status calls looking for the pending set. One inventory carries
+      // folds, raw entries, the tree and the pending marks; the summary and diagnostics are
+      // the other two. A retired name is refused by name and points at the mode that absorbed
+      // it, because a bare enum rejection would send the reader looking for the old page.
+      const details = ["folds", "objects", "tree", "marks", "diagnostics"];
+      const retiredDetails: Record<string, string> = {
+        fold_candidates: "diagnostics reports what the runtime would cut next",
+      };
       if (detail !== undefined && !details.includes(String(detail))) {
-        throw new Error(`status detail must be one of ${details.map((name) => `'${name}'`).join(", ")}`);
+        const retired = retiredDetails[String(detail)];
+        throw new Error(retired
+          ? `status detail '${String(detail)}' is retired: ${retired}. Use one of ` +
+            `${details.map((name) => `'${name}'`).join(", ")}.`
+          : `status detail must be one of ${details.map((name) => `'${name}'`).join(", ")}`);
       }
       const statusOffset = boundedInteger(params.offset, 0, 0, 1_000_000, "offset");
       const statusLimit = boundedInteger(params.limit, 40, 1, 100, "limit");
@@ -4541,6 +4575,10 @@ export function registerActiveContext(pi: any, options: {
       // question asked deliberately, so they now answer it on a deliberate page. The
       // summary counts stay inline: knowing the ledger is running is not expensive.
       const diagnosticsPage = detail === "diagnostics";
+      // THE PENDING MARKS RIDE THE INVENTORY (2026-11-16). They had a page of their own, which
+      // was right when the inventory did not carry them and wrong the moment it did: a reader
+      // asking "what is staged" and a reader asking "what is folded" were looking at one
+      // window and getting two pages.
       const marksPage = detail === "marks";
       const accounting = markAccounting(snapshot, persistence.state);
       // THE IDS TO BRIEF WITH, ON A PAGE THAT CAN HOLD ALL OF THEM (2026-11-09). The inline
@@ -4552,14 +4590,28 @@ export function registerActiveContext(pi: any, options: {
         id: mark.id,
         kind: mark.kind,
         tokens: estimatedTokens(markFreedBytes(snapshot, persistence.state!, mark)),
-        briefed: mark.briefProvenance?.kind === "supplied" ||
+        agentBrief: mark.briefProvenance?.kind === "supplied" ||
           mark.briefProvenance?.kind === "augmented",
         brief: mark.brief ?? null,
         briefProvenance: mark.briefProvenance ? clone(mark.briefProvenance) : null,
       }));
-      const markRows = pendingRows.map((row) => ({
-        id: row.id, kind: row.kind, tokens: row.tokens, briefed: row.briefed,
-      }));
+      const markRows = pendingMarks(persistence.state).map((mark) => {
+        // A ROW A READER CAN RECOGNISE (2026-11-16). The page carried id, kind, tokens and a
+        // flag, so sixty briefs written by hand each needed two calls: `peek briefOnly` to see
+        // what the mark covered, then `brief` to answer it. The span and a head of the existing
+        // brief belong on the row, and the head is bounded so forty rows still fit one page.
+        const refs = markSpanRefs(persistence.state!, mark).refs;
+        return {
+          id: mark.id,
+          kind: mark.kind,
+          tokens: estimatedTokens(markFreedBytes(snapshot, persistence.state!, mark)),
+          agentBrief: mark.briefProvenance?.kind === "supplied" ||
+            mark.briefProvenance?.kind === "augmented",
+          startId: refs[0]?.entryId ?? null,
+          endId: refs.at(-1)?.entryId ?? null,
+          head: mark.brief ? oneLine(mark.brief, MARKS_ROW_BRIEF_CHARS) : null,
+        };
+      });
       const markPageRows = markRows.slice(statusOffset, statusOffset + statusLimit);
       return toolPayload(boundStatusPayload({
         ...activeContextStatus(
@@ -4672,7 +4724,12 @@ export function registerActiveContext(pi: any, options: {
           postOverflowCallback: "blocked-while-stock-native-compaction-is-disabled",
           sameOperationRetry: false,
         },
-        ...(detail === "fold_candidates" ? {
+        ...(detail === "tree" ? { tree: foldTreeDetail(snapshot, persistence.state).slice(statusOffset) } : {}),
+        // WHAT THE RUNTIME WOULD CUT NEXT rides diagnostics now that its own detail mode is
+        // retired (2026-11-16). It answers "why did the runtime do that", which is a
+        // deliberate question rather than one a reader answering "what is in my window"
+        // needs in the same breath.
+        ...(diagnosticsPage ? {
           candidates: foldCandidatesDetail(snapshot, persistence.state, measurements.latestRatio, {
             generation: lifecycle.generation,
             measurementFresh: Boolean(measurements.lastProviderMeasurement &&
@@ -4681,7 +4738,6 @@ export function registerActiveContext(pi: any, options: {
             preparing: Boolean(ladder.preparing),
           }),
         } : {}),
-        ...(detail === "tree" ? { tree: foldTreeDetail(snapshot, persistence.state).slice(statusOffset) } : {}),
         ...(marksPage ? {
           marks: markPageRows,
           totalMarks: markRows.length,
@@ -4746,12 +4802,25 @@ export function registerActiveContext(pi: any, options: {
             } : { durable: "this result stays in your context like any other tool result" }),
           });
         }
-        // A BRIEF-ONLY READ NEEDS NO FOLD, AND NO HISTORY (2026-11-09). `brief` has always
-        // taken a pending id, so a mark carries a brief an agent decides on before writing
-        // its own; refusing here made the mark page a list of ids nothing could read. This
-        // throw belongs to the SOURCE path, which needs a span to recover. `peekFoldSource`
-        // resolves marks out of state and answers with what is known about them.
-        if (params.briefOnly !== true) throw new Error(`Unknown active-context fold ${id}`);
+        // A PENDING MARK ANSWERS TO ITS OWN ID, IN EITHER MODE (2026-11-16). The mark page
+        // handed out ids to a reader that refused every one of them, and `briefOnly` was the
+        // only way in — a switch no row mentioned. Six such refusals on 2026-11-15 sent the
+        // agent to `expand`, which applied 41 folds. A mark resolves out of state, admits no
+        // source bytes, and therefore never reaches the fence below: `admit` bounds and
+        // accounts bytes put back into the window, and this read puts back none.
+        const mark = pendingMarks(persistence.state).find((item) => item.id === id);
+        if (mark) {
+          return toolPayload(peekFoldSource({
+            foldId: id,
+            state: persistence.state,
+            entries: ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch(),
+            sessionId: ctx.sessionManager.getSessionId(),
+            offset,
+            toolName,
+            briefOnly: params.briefOnly === true,
+          }));
+        }
+        throw new Error(`Unknown active-context fold ${id}`);
       }
       // A BRIEF-ONLY READ ADMITS NO SOURCE, so it does not pass the fence that governs
       // source: `admit` exists to bound and account the bytes a read puts back into the
@@ -4816,7 +4885,22 @@ export function registerActiveContext(pi: any, options: {
         };
         if (!Object.keys(briefs).length) delete flattened.briefs;
         persistence.state = flattened;
-        const supplied = typeof params.brief === "string" && params.brief.trim() ? params.brief : undefined;
+        // A RE-CUT WRITES A BRIEF BY THE STAGED PATH'S RULE, NOT ITS OWN (2026-11-16). This
+        // path commits on the spot, so the text cannot be staged: the fold it names exists
+        // the moment this call returns and `brief` refuses a standing fold. Removing the
+        // argument therefore does not remove a second *writer* — it removes agent-authored
+        // briefs from the only verb that still names a span (`fold` is deleted), which is a
+        // capability loss with no replacement. So the carry stays and the CONTRACT moves:
+        // the same `briefContractComplaint` that governs a staged brief governs this one,
+        // and a refusal here is the same refusal an agent gets from `brief`.
+        const suppliedRaw = typeof params.brief === "string" ? params.brief.trim() : "";
+        const supplied = suppliedRaw ? suppliedRaw : undefined;
+        if (supplied !== undefined) {
+          const complaint = briefContractComplaint(
+            supplied, snapshot.policy.agentBriefReserve, snapshot.toolName,
+          );
+          if (complaint !== null) throw new Error(`Supplied brief rejected. ${complaint}`);
+        }
         const recut = manualFoldCandidate(snapshot, persistence.state, snapped.ids, { allowProtected: true });
         const created: Array<Record<string, unknown>> = [];
         const correctedBriefs: Record<string, string> = {};
@@ -4826,10 +4910,10 @@ export function registerActiveContext(pi: any, options: {
         for (const part of [recut]) {
           const durable = persistence.persistedFoldRecords.get(foldIdFor(part.kind, part.parts));
           const { preparedFold, nextState } = await prepareAndCommitExplicit({
-            // A re-cut carries the durable fold's OWN brief and provenance: those words
-            // were validated when they were first accepted, and re-judging them as a
-            // fresh agent submission would refuse a deterministic or composed brief
-            // against the agent's reserve.
+            // A re-cut carries the durable fold's OWN brief and provenance in preference to
+            // the supplied one: those words were validated when they were first accepted,
+            // and re-judging them as a fresh agent submission would refuse a deterministic
+            // or composed brief against the agent's reserve.
             snapshot, candidate: part, brief: durable ? durable.fold.brief : supplied,
             briefProvenance: durable ? durable.fold.provenance : undefined, ctx, signal,
           });
@@ -4955,6 +5039,89 @@ export function registerActiveContext(pi: any, options: {
       // is the opposite case and is refused by name: its placeholder is already in the
       // window, and rewriting it breaks the cache from that point on, which is the
       // rebrief deletion of 2026-08-21 read from the other side.
+      // A SWEEP IN ONE CALL (2026-11-16). The verb was single-target over a set that moves:
+      // 105 attempts landed 43 briefs in one session and 139 landed 131 in another, with 8
+      // attempts in each refused for naming an id that had committed in the meantime — and
+      // under a batched tool call one stale id poisoned the whole script. The batch answers
+      // each id separately, applies everything that is still true, and never aborts the rest.
+      if (params.briefs !== undefined) {
+        if (!Array.isArray(params.briefs) || params.briefs.length === 0) {
+          throw new Error("briefs must be a non-empty array of {id, brief} pairs");
+        }
+        const heldBatch = pendingMarks(persistence.state!);
+        const standingIds = new Set(persistence.state!.folds.map((fold) => fold.id));
+        const applied: Array<{ id: string; chars: number }> = [];
+        const refused: Array<{ id: string; reason: string }> = [];
+        const accepted = new Map<string, string>();
+        for (const raw of params.briefs) {
+          const entry = (raw ?? {}) as Record<string, unknown>;
+          const entryId = String(entry.id ?? "").trim();
+          if (!entryId) {
+            refused.push({ id: "", reason: "this entry carries no id" });
+            continue;
+          }
+          if (accepted.has(entryId)) {
+            refused.push({ id: entryId, reason: "the same id appears twice in this batch" });
+            continue;
+          }
+          if (standingIds.has(entryId)) {
+            refused.push({ id: entryId, reason:
+              "standing fold: its brief is already in your window, and rewriting it would " +
+              "rewrite the projection from that placeholder on. Re-cut the span instead" });
+            continue;
+          }
+          if (!heldBatch.some((mark) => mark.id === entryId)) {
+            refused.push({ id: entryId, reason:
+              "not a pending fold on this branch — it was committed, withdrawn, or never existed" });
+            continue;
+          }
+          const entryText = typeof entry.brief === "string" ? entry.brief.trim() : "";
+          const complaint = briefContractComplaint(
+            entryText, snapshot.policy.agentBriefReserve, snapshot.toolName,
+          );
+          if (complaint !== null) {
+            refused.push({ id: entryId, reason: complaint });
+            continue;
+          }
+          accepted.set(entryId, entryText);
+          applied.push({ id: entryId, chars: entryText.length });
+        }
+        if (accepted.size) {
+          const nextState = {
+            ...persistence.state!,
+            revision: persistence.state!.revision + 1,
+            pendingMarks: heldBatch.map((mark) => accepted.has(mark.id)
+              ? {
+                ...mark,
+                brief: accepted.get(mark.id)!,
+                briefProvenance: { kind: "supplied" as const },
+              }
+              : mark),
+          };
+          persistence.state = nextState;
+          await persistManual(nextState, ctx);
+          updateStatus(ctx);
+          for (const entry of applied) {
+            emit("context.brief", { id: entry.id, chars: entry.chars, origin: "agent" });
+          }
+        }
+        const batchAccounting = markAccounting(snapshot, persistence.state!);
+        return toolPayload({
+          version: 1,
+          action,
+          applied,
+          refused,
+          provenance: "agent",
+          durableRevision: persistence.state!.revision,
+          pendingMarks: batchAccounting.pending,
+          activation: `${applied.length} brief(s) stored outside the projection and reaching it ` +
+            "only when their commit folds those spans; nothing in your context moved." +
+            (refused.length
+              ? ` ${refused.length} refused by name — the rest were kept, so this sweep is ` +
+                "one call, not a retry from the top."
+              : ""),
+        });
+      }
       const id = String(params.id ?? "").trim();
       if (!id) throw new Error("brief needs the id of a pending fold");
       const standing = persistence.state!.folds.find((fold) => fold.id === id);
@@ -5002,9 +5169,6 @@ export function registerActiveContext(pi: any, options: {
         argumentsSha256: executionArgumentsSha256,
         durableRevision: persistence.state!.revision,
         pendingMarks: accounting.pending,
-        unbriefed: pendingMarks(persistence.state!)
-          .filter((mark) => mark.briefProvenance?.kind !== "supplied" &&
-            mark.briefProvenance?.kind !== "augmented").map((mark) => mark.id),
         unmarkedSpans: remainder.spans,
         unmarkedTokens: remainder.tokens,
         activation: "durable immediately, and it costs your window nothing: this fold is " +
@@ -5469,7 +5633,7 @@ export function registerActiveContext(pi: any, options: {
     allowedActions: allowedToolActions,
     fullSurface: true,
     maxBriefChars: ACTIVE_CONTEXT_POLICY.agentBriefReserve,
-    statusDetails: ["fold_candidates", "tree", "folds", "objects", "marks", "diagnostics"],
+    statusDetails: ["folds", "objects", "tree", "marks", "diagnostics"],
     minPeekSliceBytes: PEEK_MIN_SLICE_BYTES,
     defaultPeekBytes: PEEK_DEFAULT_MAX_BYTES,
     handler: toolHandler,
