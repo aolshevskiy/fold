@@ -314,6 +314,10 @@ function makeRuntime(built, {
   preCommitNotice,
   noticeLeadShare,
   packageRegistration = false,
+  // A loaded copy of extensions/index.js whose DEFAULT export registers, exactly as pi
+  // calls it: no options. Gate 197 loads its own copy so the settings path it reads is a
+  // scratch home rather than the person's.
+  packageEntry,
   parentSession = null,
   sessionFile = join(tmpdir(), "pi-fold-test-session.jsonl"),
   // One injection point for a durable write that FAILS. Persistence is the only place
@@ -455,7 +459,9 @@ function makeRuntime(built, {
     ...(preCommitNotice === undefined ? {} : { preCommitNotice }),
     ...(noticeLeadShare === undefined ? {} : { noticeLeadShare }),
   };
-  if (packageRegistration) {
+  if (packageEntry) {
+    runtime.registration = packageEntry.default(pi);
+  } else if (packageRegistration) {
     runtime.registration = piFold.registerPiFold(pi, registrationOptions);
   } else {
     // The internal seam. Evidence first, then the runtime, which is the order the
@@ -19562,6 +19568,21 @@ async function gateSystemMessagesStayOutOfTheWindow() {
   return { folds: loaded.folds.length, projected: result.messages.length, raw: runtime.messages.length };
 }
 
+// THE PACKAGE ENTRY READS ~/.config/pi-fold/settings.json WHEN IT LOADS (gate 197), so any
+// gate that loads it must load it against a home it owns, or the person's own settings
+// decide what the fixture folds. HOME is read once, while the module evaluates, and pi's
+// loader evaluates afresh on every load, so the swap only has to span the load itself.
+async function withHome(home, load) {
+  const previous = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    return await load();
+  } finally {
+    if (previous === undefined) delete process.env.HOME;
+    else process.env.HOME = previous;
+  }
+}
+
 async function gateHostPeersAndSdkSession() {
   const manifest = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"));
   const lock = JSON.parse(readFileSync(join(projectRoot, "package-lock.json"), "utf8"));
@@ -19613,7 +19634,7 @@ async function gateHostPeersAndSdkSession() {
       noThemes: true, noContextFiles: true,
       additionalExtensionPaths: [join(projectRoot, "extensions", "index.js")],
     });
-    await loader.reload();
+    await withHome(directory, () => loader.reload());
     assert.deepEqual(loader.getExtensions().errors, []);
     const frames = [];
     const replies = [];
@@ -19701,7 +19722,7 @@ async function gateDiskSdkFork() {
         noThemes: true, noContextFiles: true,
         additionalExtensionPaths: [join(projectRoot, "extensions", "index.js")],
       });
-      await loader.reload();
+      await withHome(directory, () => loader.reload());
       assert.deepEqual(loader.getExtensions().errors, []);
       const { session } = await sdk.createAgentSession({
         cwd: directory, agentDir: directory, modelRuntime, model, thinkingLevel: "off",
@@ -19943,7 +19964,7 @@ async function gateAutoCompactionOffRecovery() {
       noThemes: true, noContextFiles: true,
       additionalExtensionPaths: [join(projectRoot, "extensions", "index.js")],
     });
-    await loader.reload();
+    await withHome(directory, () => loader.reload());
     const manager = sdk.SessionManager.create(directory, directory);
     const built = makeFixture({ turns: 15, tools: false, chapterChars: 3_500 });
     for (const message of built.messages) manager.appendMessage(message);
@@ -20517,6 +20538,69 @@ async function gateRetiredIdResolves() {
   return { successor, successors: read.retired.supersededBy.length };
 }
 
+/**
+ * GATE 197: THE PACKAGE ENTRY IS THE WHOLE DEPLOYMENT.
+ *
+ * Pi loads the default export of extensions/index.js and passes no options. The entry used
+ * to call registerPiFold and nothing else, so an npm install had no /fold-settings and
+ * never read ~/.config/pi-fold/settings.json, while the README advertised both. Every gate
+ * drove registerFoldSettings by hand — gate 161 registers it against `runtime.pi` itself —
+ * and so did the workstation deployment, so the one path a user actually takes was the one
+ * path nothing ran. `84c9475` fixed the entry; this gate is what keeps it fixed, because
+ * nothing else in this suite loads the default export.
+ *
+ * This gate loads its OWN copy of the entry with HOME pointed at a scratch directory, so
+ * the settings path the module resolves at load is a file the gate wrote. It reads the
+ * result three ways: the commands the README lists are the commands registered, the
+ * session starts on the file's commit point rather than the package's, and the screen
+ * finds the runtime on the same host.
+ *
+ * ANTI-VACUITY: on an entry that only calls registerPiFold, /fold-settings is missing from
+ * the registered set and the status line reads the package's 72 percent instead of the
+ * file's 45.
+ */
+async function gatePackageEntryIsTheWholeDeployment() {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-fold-package-entry-"));
+  const themeLike = { fg: (_role, text) => text, bold: (text) => text };
+  try {
+    settingsModule.saveFoldSettingsFile(join(scratch, ".config", "pi-fold", "settings.json"), {
+      thresholds: { maxTarget: 0.5, minTarget: 0.2, consolidateAfter: 10, minFoldChars: 8000 },
+    });
+    const entry = await withHome(scratch, () => createJiti(import.meta.url, { moduleCache: false })
+      .import(join(projectRoot, "extensions", "index.js")));
+    const runtime = makeRuntime(
+      makeFixture({ turns: 8, resultChars: 3_000, sessionId: "package-entry" }),
+      { packageEntry: entry },
+    );
+
+    const advertised = [...readFileSync(join(projectRoot, "README.md"), "utf8")
+      .matchAll(/^\| `\/([a-z-]+)` \|/gm)].map((match) => match[1]).sort();
+    const registered = [...runtime.commands.keys()].sort();
+    assert.deepEqual(registered, ["fold", "fold-editor", "fold-settings", "fold-status"],
+      `the package entry registered ${registered.join(", ")}`);
+    assert.deepEqual(advertised, registered,
+      `the README advertises ${advertised.join(", ")} but the package entry registers ${registered.join(", ")}`);
+
+    // A 100,000-token window serves 90,000, so the file's 50 percent commit point reads
+    // as 45 percent of the window, and the package's 80 percent would read as 72.
+    await startRuntime(runtime);
+    await measure(runtime, 30_000, 100_000);
+    await project(runtime);
+    await settle();
+    const line = runtime.statuses.at(-1).text;
+    assert(line.includes("commit at 45%"), `the session did not start on the settings file: ${line}`);
+
+    let screen = null;
+    runtime.ctx.ui.custom = async (factory) => { screen = factory({}, themeLike, {}, () => {}); };
+    await runtime.commands.get("fold-settings").handler("", runtime.ctx);
+    assert(screen?.render(120).join("\n").includes("takes effect at once"),
+      "/fold-settings did not find the runtime the package entry registered");
+    return { commands: registered.length, commitPoint: "45%", live: true };
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 const gates = [
   [1, "Registration, parse and deployment branding", gateRegistrationAndBranding],
   [2, "The durable record: lattice, chain and rollback", gateDurableRecord],
@@ -20691,6 +20775,7 @@ const gates = [
   [194, "Peek answers by state", gatePeekAnswersByState],
   [195, "The ride carries the row a brief needs", gateRideCarriesTheRowShape],
   [196, "A retired id says where its bytes went", gateRetiredIdResolves],
+  [197, "The package entry is the whole deployment", gatePackageEntryIsTheWholeDeployment],
 ];
 
 const gateFilter = (process.env.GATES ?? "")
